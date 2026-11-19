@@ -6,23 +6,39 @@ setup() {
   export CQ_DIR="$(mktemp -d)"
   export REPO="$(mktemp -d)"
   export MOCK_DIR="$(mktemp -d)"
+  export CQ_CONFIG_DIR="$(mktemp -d)"
   export PATH="$MOCK_DIR:$PATH"
   NOW="$(date +%s)"
 
-  for cmd in zed tmux pbcopy open osascript terminal-notifier; do
+  for cmd in zed tmux open osascript terminal-notifier ps; do
     cat > "$MOCK_DIR/$cmd" << EOF
 #!/usr/bin/env bash
 echo "$cmd \$*" >> "$MOCK_DIR/calls"
 EOF
     chmod +x "$MOCK_DIR/$cmd"
   done
-  echo 'cat > /dev/null' >> "$MOCK_DIR/pbcopy"
   # The script on stdin isn't needed; print the outcome the test asks for.
   printf 'cat > /dev/null\necho "${OSASCRIPT_RESULT:-ok}"\n' >> "$MOCK_DIR/osascript"
+  # tmux reports the panes and attached terminals in $TMUX_PANES and
+  # $TMUX_CLIENTS, as tab-separated lines.
+  cat >> "$MOCK_DIR/tmux" << 'EOF'
+case "$1" in
+  list-panes) printf '%b' "${TMUX_PANES:-}" ;;
+  list-clients) printf '%b' "${TMUX_CLIENTS:-}" ;;
+esac
+EOF
+  # ps -E reports $PS_BUNDLE as a process's app. Anything else is real ps.
+  cat >> "$MOCK_DIR/ps" << 'EOF'
+if [ "$1" = "-E" ]; then
+  echo "tmux attach __CFBundleIdentifier=${PS_BUNDLE:-org.tabby}"
+else
+  exec /bin/ps "$@"
+fi
+EOF
 }
 
 teardown() {
-  rm -rf "$CQ_DIR" "$REPO" "$MOCK_DIR"
+  rm -rf "$CQ_DIR" "$REPO" "$MOCK_DIR" "$CQ_CONFIG_DIR"
 }
 
 # state <id> <status> <seconds ago> [extra jq]
@@ -116,13 +132,102 @@ state() {
   grep -q "^open -a ghostty$" "$MOCK_DIR/calls"
 }
 
-@test "open switches to a session's tmux pane" {
-  state abc123 idle 5 '.entrypoint = "cli" | .app = "org.tabby" | .tmux_pane = "%3"'
-  printf 'exit 0\n' >> "$MOCK_DIR/tmux"
+@test "open switches the terminal showing a session's tmux session, and brings it forward" {
+  # The hook recorded Zed, but tmux session 4 is showing in Tabby: tmux's
+  # environment comes from whichever app started the tmux server.
+  state abc123 idle 5 '.entrypoint = "cli" | .app = "dev.zed.Zed" | .tmux_pane = "%3"'
+  export TMUX_PANES='%3\t4\n' TMUX_CLIENTS='4\t100\t/dev/ttys008\t555\n' PS_BUNDLE=org.tabby
   run bash "$SCRIPT" open abc
   [ "$status" -eq 0 ]
+  grep -q "^tmux switch-client -c /dev/ttys008 -t %3$" "$MOCK_DIR/calls"
   grep -q "^tmux select-pane -t %3$" "$MOCK_DIR/calls"
+  grep -q "^open -b org.tabby$" "$MOCK_DIR/calls"
   ! grep -q "^terminal-notifier" "$MOCK_DIR/calls"
+  ! grep -q "^osascript" "$MOCK_DIR/calls"
+}
+
+@test "a tmux session uses the terminal most recently active on it" {
+  state abc123 idle 5 '.entrypoint = "cli" | .tmux_pane = "%3"'
+  export TMUX_PANES='%3\t4\n' TMUX_CLIENTS='4\t100\t/dev/ttys008\t555\n4\t200\t/dev/ttys013\t556\n'
+  run bash "$SCRIPT" open abc
+  grep -q "^tmux switch-client -c /dev/ttys013 -t %3$" "$MOCK_DIR/calls"
+}
+
+@test "shows the app of the terminal showing a session's tmux session" {
+  state abc123 idle 5 '.entrypoint = "cli" | .app = "dev.zed.Zed" | .tmux_pane = "%3"'
+  export TMUX_PANES='%3\t4\n' TMUX_CLIENTS='4\t100\t/dev/ttys008\t555\n' PS_BUNDLE=org.tabby
+  run bash "$SCRIPT" --swiftbar
+  [[ "$output" == *"🐈⚪ "*'tooltip="Running in tmux session 4, in Tabby.'* ]]
+}
+
+@test "open says so when no terminal is showing a session's tmux session" {
+  state abc123 idle 5 '.entrypoint = "cli" | .tmux_pane = "%3"'
+  export TMUX_PANES='%3\t4\n'
+  run bash "$SCRIPT" --swiftbar
+  [[ "$output" == *"💻⚪ "*'tooltip="Running in tmux session 4, which no terminal is showing.'* ]]
+  run bash "$SCRIPT" open abc
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Run: tmux attach -t 4"* ]]
+  ! grep -q "^tmux switch-client" "$MOCK_DIR/calls"
+}
+
+@test "apps.json overrides and adds apps" {
+  cat > "$CQ_CONFIG_DIR/apps.json" << 'EOF'
+{"org.tabby": {"emoji": "🐱"}, "com.mitchellh.ghostty": {"name": "Ghostty", "emoji": "👻"}}
+EOF
+  state tabby idle 5 '.entrypoint = "cli" | .app = "org.tabby"'
+  state ghostty idle 5 '.entrypoint = "cli" | .app = "com.mitchellh.ghostty"'
+  run bash "$SCRIPT" --swiftbar
+  [[ "$output" == *"🐱⚪ "*'param2=tabby '*'Running in Tabby.'* ]]
+  [[ "$output" == *"👻⚪ "*'param2=ghostty '*'Running in Ghostty.'* ]]
+}
+
+@test "an apps.json that isn't valid JSON is ignored, with a notification" {
+  echo '{not json' > "$CQ_CONFIG_DIR/apps.json"
+  state tabby idle 5 '.entrypoint = "cli" | .app = "org.tabby"'
+  run bash "$SCRIPT" --swiftbar
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"🐈⚪ "* ]]
+  grep -q "^terminal-notifier.*Ignoring" "$MOCK_DIR/calls"
+}
+
+@test "open runs your own opener for an app, with the session's details" {
+  mkdir -p "$CQ_CONFIG_DIR/openers"
+  cat > "$CQ_CONFIG_DIR/openers/my-opener" << EOF
+#!/usr/bin/env bash
+env | grep '^CQ_' | sort > "$MOCK_DIR/opener_env"
+echo "Opened it"
+EOF
+  chmod +x "$CQ_CONFIG_DIR/openers/my-opener"
+  echo '{"org.tabby": {"open": "my-opener"}}' > "$CQ_CONFIG_DIR/apps.json"
+  state abc123 idle 5 '.entrypoint = "cli" | .app = "org.tabby" | .tty = "ttys008"'
+  run bash "$SCRIPT" open abc
+  [ "$status" -eq 0 ]
+  grep -q "^CQ_SESSION_ID=abc123$" "$MOCK_DIR/opener_env"
+  grep -q "^CQ_CWD=$REPO$" "$MOCK_DIR/opener_env"
+  grep -q "^CQ_APP=org.tabby$" "$MOCK_DIR/opener_env"
+  grep -q "^CQ_APP_NAME=Tabby$" "$MOCK_DIR/opener_env"
+  grep -q "^CQ_TTY=ttys008$" "$MOCK_DIR/opener_env"
+  grep -q "^terminal-notifier.*Opened it" "$MOCK_DIR/calls"
+}
+
+@test "an opener's exit status is open's" {
+  mkdir -p "$CQ_CONFIG_DIR/openers"
+  printf '#!/usr/bin/env bash\necho "Nope"\nexit 3\n' > "$CQ_CONFIG_DIR/openers/failing"
+  chmod +x "$CQ_CONFIG_DIR/openers/failing"
+  echo '{"org.tabby": {"open": "failing"}}' > "$CQ_CONFIG_DIR/apps.json"
+  state abc123 idle 5 '.entrypoint = "cli" | .app = "org.tabby"'
+  run bash "$SCRIPT" open abc
+  [ "$status" -eq 3 ]
+  [[ "$output" == *"Nope"* ]]
+}
+
+@test "open says so when an app's opener doesn't exist" {
+  echo '{"org.tabby": {"open": "missing"}}' > "$CQ_CONFIG_DIR/apps.json"
+  state abc123 idle 5 '.entrypoint = "cli" | .app = "org.tabby"'
+  run bash "$SCRIPT" open abc
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"no cq opener called missing"* ]]
 }
 
 @test "shows each session's app" {

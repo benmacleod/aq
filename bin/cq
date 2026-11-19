@@ -18,8 +18,9 @@ Commands:
                         working ones, oldest first. -a also shows snoozed
                         sessions, and ones you haven't prompted yet. This is
                         the default.
-  open <n|id>           Switch to the session: focus its Zed window, or its
-                        tmux pane, or copy its resume command.
+  open <n|id>           Switch to the session: its tmux pane if it has one,
+                        or else whatever its app's opener does (see the
+                        README).
   snooze <n|id> [dur]   Hide the session for a while (e.g. 30m, 2h, 1d).
                         The default is 1h.
   dismiss <n|id>        Take the session off the list. It comes back when
@@ -33,17 +34,68 @@ Commands:
 EOF
 }
 
-# The apps cq knows, by bundle ID: the name and emoji to show, and how to
-# switch to a session (see cmd_open). Other apps get 💻 and their
-# TERM_PROGRAM as a name, and cq just brings them to the front.
+CQ_CONFIG_DIR="${CQ_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/cq}"
+
+# Prints a message, and also shows it as a notification, since nobody sees
+# the output when SwiftBar runs cq.
+notify() {
+  echo "$1" >&2
+  terminal-notifier -title cq -message "$1" -group cq >/dev/null 2>&1 || true
+}
+
+# The apps cq knows, by bundle ID: the name and emoji to show, and the
+# opener that switches to a session (see run_opener). Other apps get 💻,
+# their TERM_PROGRAM as a name, and the "activate" opener.
+# $CQ_CONFIG_DIR/apps.json, in the same shape, is merged over this.
 APPS='{
   "dev.zed.Zed": {"name": "Zed", "emoji": "⚡", "open": "zed-window"},
   "org.tabby": {"name": "Tabby", "emoji": "🐈"}
 }'
+if [ -f "$CQ_CONFIG_DIR/apps.json" ]; then
+  if merged="$(jq -s '.[0] * .[1]' <(echo "$APPS") "$CQ_CONFIG_DIR/apps.json" 2>/dev/null)"; then
+    APPS="$merged"
+  else
+    notify "Ignoring $CQ_CONFIG_DIR/apps.json, which isn't valid JSON."
+  fi
+fi
+
+# Prints the bundle ID of the app a process belongs to, from the
+# __CFBundleIdentifier that macOS passes to every process an app starts.
+process_app() {
+  ps -E -o command= -p "$1" 2>/dev/null | tr ' ' '\n' | sed -n 's/^__CFBundleIdentifier=//p' | head -n1
+}
+
+# Prints, as JSON, where each tmux pane is showing: its tmux session, and the
+# terminal (TTY and app) most recently active on that session, if any:
+# {"%16": {"session": "4", "client_tty": "/dev/ttys008", "app": "org.tabby"}}.
+#
+# The hook can't record this for a session in tmux: the tmux server's
+# environment comes from whichever app first started it, and you can attach
+# to a tmux session from more than one terminal.
+tmux_json() {
+  local panes clients s activity tty pid
+  if ! command -v tmux >/dev/null || ! panes="$(tmux list-panes -a -F '#{pane_id}	#{session_name}' 2>/dev/null)"; then
+    echo '{}'
+    return
+  fi
+  clients="$(tmux list-clients -F '#{session_name}	#{client_activity}	#{client_tty}	#{client_pid}' 2>/dev/null \
+    | while IFS=$'\t' read -r s activity tty pid; do
+        printf '%s\t%s\t%s\t%s\n' "$s" "$activity" "$tty" "$(process_app "$pid")"
+      done)"
+  jq -n --arg panes "$panes" --arg clients "$clients" '
+    def rows: split("\n") | map(select(. != "") | split("\t"));
+    ($clients | rows
+      | map({session: .[0], activity: (.[1] | tonumber), client_tty: .[2], app: .[3]})
+      | group_by(.session) | map(max_by(.activity) | del(.activity)) | INDEX(.session)) as $clients
+    | $panes | rows
+    | map({key: .[0], value: ({session: .[1]} + ($clients[.[1]] // {}))})
+    | from_entries'
+}
+TMUX_JSON="$(tmux_json)"
 
 # jq with the definitions the commands share.
 cq_jq() {
-  jq --argjson now "$NOW" --arg home "$HOME" --argjson apps "$APPS" "$@"
+  jq --argjson now "$NOW" --arg home "$HOME" --argjson apps "$APPS" --argjson tmux "$TMUX_JSON" "$@"
 }
 
 JQ_DEFS='
@@ -54,18 +106,31 @@ JQ_DEFS='
       else "\($s / 86400 | floor)d" end;
   def place: (.cwd // "?") | sub("^" + $home + "/Code/"; "") | sub("^" + $home; "~");
   def title: .title // "" | select(. != "");
-  # The app the session runs in: {name, emoji, open}. Sessions recorded
+  # Where the session is showing in tmux, if it runs in tmux: see tmux_json.
+  def tmux: $tmux[.tmux_pane // ""];
+  # The app the session runs in: {id, name, emoji, open}. For a session in
+  # tmux, that is the terminal showing its tmux session. Sessions recorded
   # before cq-hook stored the bundle ID are matched on TERM_PROGRAM, and
   # are Zed if they ran in no terminal.
   def app:
-    (.app // "") as $id
-    | (.term_program // "") as $term
+    (if tmux then (tmux.app // "") else (.app // "") end) as $id
+    | (if tmux then "" else (.term_program // "") end) as $term
     | ([$apps[] | select(.name == $term)] | first) as $by_name
     | if $apps[$id] then $apps[$id]
+      elif tmux and $id == "" then {name: "tmux", emoji: "💻"}
       elif $id == "" and $by_name then $by_name
       elif $id == "" and (.entrypoint != "cli" or $term == "zed") then $apps["dev.zed.Zed"]
       else {name: ([$term, $id, "terminal"] | map(select(. != "")) | first), emoji: "💻"}
-      end;
+      end
+    | {id: $id, open: "activate"} + .;
+  # e.g. "Tabby (ttys008)", or "tmux session 4, in Tabby".
+  def where:
+    if tmux then
+      "tmux session \(tmux.session)"
+      + (if tmux.client_tty then ", in \(app.name)" else ", which no terminal is showing" end)
+    else
+      app.name + (.tty // "" | if . == "" then "" else " (\(.))" end)
+    end;
   def rank: {"needs-input": 0, "idle": 1, "working": 2}[.status // ""] // 3;
   # "new" is a session nobody has prompted yet, e.g. a Zed thread you opened
   # but never typed into.
@@ -163,84 +228,66 @@ cmd_list() {
   done <<<"$rows"
 }
 
-# Prints a message, and also shows it as a notification, since nobody sees
-# the output when SwiftBar runs cq.
-complain() {
-  echo "$1" >&2
-  terminal-notifier -title cq -message "$1" -group cq >/dev/null 2>&1 || true
-}
-
-# Brings forward the Zed window for a project folder, by window title. The
-# zed CLI can't do this: `zed <dir>` opens a new window when
-# cli_default_open_behavior is "new_window", and `zed -e <dir>` opens the
-# folder in whichever window is current. Zed titles a window after its
-# project folder, e.g. "tc-5031 — README.md".
+# run_opener <name> <session JSON>
 #
-# Needs Accessibility permission for whatever runs cq: SwiftBar, or your
-# terminal.
-focus_zed_window() {
-  local name="$1" result
-  result="$(osascript - "$name" 2>&1 <<'EOF'
-on run argv
-  set folderName to item 1 of argv
-  tell application "System Events"
-    if not (exists process "Zed") then return "no-zed"
-    tell process "Zed"
-      set matches to (every window whose name is folderName or name starts with (folderName & " "))
-      if matches is {} then return "no-window"
-      perform action "AXRaise" of item 1 of matches
-      set frontmost to true
-    end tell
-  end tell
-  return "ok"
-end run
-EOF
-)"
-  case "$result" in
-    ok) return 0 ;;
-    no-zed) complain "Zed isn't running." ;;
-    no-window) complain "No Zed window is open on $name." ;;
-    *assistive\ access*|*-1719*|*-25211*)
-      complain "cq needs Accessibility permission to switch Zed windows. Add SwiftBar (or your terminal) in System Settings > Privacy & Security > Accessibility." ;;
-    *) complain "Couldn't switch to the Zed window for $name: $result" ;;
-  esac
-  return 1
+# Runs the opener called <name>: an executable in $CQ_CONFIG_DIR/openers, or
+# one of cq's own in lib/cq-openers. It gets the session's details as CQ_*
+# environment variables. Whatever it prints is shown as a notification, and
+# its exit status is cq open's.
+run_opener() {
+  local name="$1" session="$2" opener="" dir output status
+  for dir in "$CQ_CONFIG_DIR/openers" "$(dirname "$SELF")/../lib/cq-openers"; do
+    if [ -x "$dir/$name" ]; then
+      opener="$dir/$name"
+      break
+    fi
+  done
+  if [ -z "$opener" ]; then
+    notify "There's no cq opener called $name. Add one to $CQ_CONFIG_DIR/openers."
+    return 1
+  fi
+  status=0
+  output="$(
+    eval "$(cq_jq -r "$JQ_DEFS
+      {CQ_SESSION_ID: .session_id, CQ_CWD: .cwd, CQ_PLACE: place, CQ_TTY: .tty,
+       CQ_APP: app.id, CQ_APP_NAME: app.name}
+      | to_entries[] | \"export \(.key)=\(.value // \"\" | @sh)\"" <<<"$session")"
+    "$opener"
+  )" || status=$?
+  [ -n "$output" ] && notify "$output"
+  return "$status"
 }
 
 cmd_open() {
   [ $# -ge 1 ] || { usage >&2; exit 1; }
-  local id cwd place bundle name how tmux_pane tty
+  local id session cwd place opener pane tmux_session client_tty app_id
   id="$(resolve "$1")"
-  IFS=$'\x1f' read -r cwd place bundle name how tmux_pane tty < <(cq_jq -r "$JQ_DEFS
-    [.cwd, place, .app, (app | .name), (app | .open), .tmux_pane, .tty]
-    | map(. // \"\") | join(\"\\u001f\")" "$(cq_state_file "$id")")
+  session="$(cat "$(cq_state_file "$id")")"
+  IFS=$'\x1f' read -r cwd place opener pane tmux_session client_tty app_id < <(cq_jq -r "$JQ_DEFS
+    [.cwd, place, app.open, .tmux_pane, tmux.session, tmux.client_tty, app.id]
+    | map(. // \"\") | join(\"\\u001f\")" <<<"$session")
 
   if [ -z "$cwd" ] || [ ! -d "$cwd" ]; then
-    complain "The session's directory ($cwd) no longer exists. Try: cq prune"
+    notify "The session's directory ($cwd) no longer exists. Try: cq prune"
     exit 1
   fi
 
-  if [ "$how" = "zed-window" ]; then
-    focus_zed_window "$(basename "$cwd")"
-    return
-  fi
-
-  # Bring the app forward. With no bundle ID (a session recorded before
-  # cq-hook stored it), try the app's name.
-  if [ -n "$bundle" ]; then
-    open -b "$bundle" 2>/dev/null || true
-  else
-    open -a "$name" 2>/dev/null || true
-  fi
-
-  if [ -n "$tmux_pane" ] && tmux has-session -t "$tmux_pane" 2>/dev/null; then
-    tmux switch-client -t "$tmux_pane" 2>/dev/null || true
-    tmux select-window -t "$tmux_pane" && tmux select-pane -t "$tmux_pane"
+  # In tmux: switch the terminal showing the session's tmux session to the
+  # session's pane (not whichever terminal tmux used last), then bring that
+  # terminal forward.
+  if [ -n "$tmux_session" ]; then
+    if [ -z "$client_tty" ]; then
+      notify "$place is in tmux session $tmux_session, which no terminal is showing. Run: tmux attach -t $tmux_session"
+      exit 1
+    fi
+    tmux switch-client -c "$client_tty" -t "$pane"
+    tmux select-window -t "$pane"
+    tmux select-pane -t "$pane"
+    [ -n "$app_id" ] && open -b "$app_id" 2>/dev/null
     return 0
   fi
 
-  # Most terminals can't be told to switch tabs, so say which tab to pick.
-  complain "$place is in $name${tty:+ ($tty)}. Switch to its tab."
+  run_opener "$opener" "$session"
 }
 
 cmd_snooze() {
@@ -284,7 +331,7 @@ cmd_swiftbar() {
     def run(\$cmd; \$id): \" | bash=\" + \$cq + \" param1=\" + \$cmd + (\$id | if . then \" param2=\" + . else \"\" end) + \" terminal=false refresh=true\";
     def tooltip:
       [(.message // \"\" | select(. != \"\")),
-       \"Running in \(app | .name)\" + (.tty // \"\" | if . == \"\" then \"\" else \" (\(.))\" end),
+       \"Running in \(where)\",
        \"Option-click to dismiss\"]
       | join(\". \") | clean;
     ([.[] | select(.status == \"needs-input\")] | length) as \$needs

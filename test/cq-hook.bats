@@ -5,12 +5,38 @@ HOOK="$BATS_TEST_DIRNAME/../bin/cq-hook"
 setup() {
   export CQ_DIR="$(mktemp -d)"
   export REPO="$(mktemp -d)"
+  export MOCK_DIR="$(mktemp -d)"
+  export PATH="$MOCK_DIR:$PATH"
   STATE="$CQ_DIR/s1.json"
+
+  # A claude that records how it was called, then replies with a title
+  # after $CLAUDE_DELAY seconds.
+  cat > "$MOCK_DIR/claude" << 'EOF'
+#!/usr/bin/env bash
+cat > /dev/null
+echo "$* CQ_HOOK_DISABLED=$CQ_HOOK_DISABLED" >> "$MOCK_DIR/claude_calls"
+sleep "${CLAUDE_DELAY:-0}"
+echo '"Summarized title."'
+EOF
+  chmod +x "$MOCK_DIR/claude"
 }
 
 teardown() {
-  rm -rf "$CQ_DIR" "$REPO"
+  rm -rf "$CQ_DIR" "$REPO" "$MOCK_DIR"
 }
+
+# Waits up to 5 seconds for the session's title to become $1.
+wait_for_title() {
+  local i
+  for i in $(seq 50); do
+    [ "$(field title)" = "$1" ] && return 0
+    sleep 0.1
+  done
+  echo "title is $(field title)" >&2
+  return 1
+}
+
+LONG_PROMPT="Please look into why the newsletter footer links fail the contrast check in dark mode"
 
 hook() {
   printf '%s' "$1" | bash "$HOOK"
@@ -68,6 +94,48 @@ field() {
   [ "$(field title)" = "Fix the footer" ]
   hook '{"hook_event_name":"UserPromptSubmit","session_id":"s1","prompt":"Something else"}'
   [ "$(field title)" = "Something else" ]
+}
+
+@test "short prompts aren't summarized" {
+  hook '{"hook_event_name":"UserPromptSubmit","session_id":"s1","prompt":"Fix the footer"}'
+  sleep 0.3
+  [ ! -f "$MOCK_DIR/claude_calls" ]
+}
+
+@test "a long prompt gets a summarized title, from a Claude with no tools or settings" {
+  hook "{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"s1\",\"prompt\":\"$LONG_PROMPT\"}"
+  wait_for_title "Summarized title"
+  grep -q -- '--model haiku' "$MOCK_DIR/claude_calls"
+  grep -q -- '--no-session-persistence' "$MOCK_DIR/claude_calls"
+  grep -q -- '--tools  ' "$MOCK_DIR/claude_calls"
+  grep -q 'CQ_HOOK_DISABLED=1' "$MOCK_DIR/claude_calls"
+}
+
+@test "the hook returns before the summary is ready" {
+  export CLAUDE_DELAY=2
+  start=$SECONDS
+  hook "{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"s1\",\"prompt\":\"$LONG_PROMPT\"}"
+  [ $((SECONDS - start)) -lt 2 ]
+  [ "$(field title)" != "Summarized title" ]
+}
+
+@test "a late summary doesn't replace a newer prompt's title" {
+  export CLAUDE_DELAY=1
+  hook "{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"s1\",\"prompt\":\"$LONG_PROMPT\"}"
+  CQ_SUMMARIZE=0 hook '{"hook_event_name":"UserPromptSubmit","session_id":"s1","prompt":"Newer prompt"}'
+  sleep 1.5
+  [ "$(field title)" = "Newer prompt" ]
+}
+
+@test "CQ_SUMMARIZE=0 turns summarizing off" {
+  CQ_SUMMARIZE=0 hook "{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"s1\",\"prompt\":\"$LONG_PROMPT\"}"
+  sleep 0.3
+  [ ! -f "$MOCK_DIR/claude_calls" ]
+}
+
+@test "CQ_HOOK_DISABLED=1 makes the hook do nothing" {
+  CQ_HOOK_DISABLED=1 hook '{"hook_event_name":"UserPromptSubmit","session_id":"s1","prompt":"hi"}'
+  [ ! -f "$STATE" ]
 }
 
 @test "AskUserQuestion and ExitPlanMode mark the session as needing input" {

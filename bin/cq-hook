@@ -51,6 +51,29 @@ waiting_message() {
   esac
 }
 
+# Asks Claude for a short title for a prompt, and stores it, unless a newer
+# prompt has arrived since. Run it in the background: it takes a few
+# seconds.
+#
+# The child Claude gets no tools, MCP servers or settings, so it can only
+# reply, not try to carry out the prompt, and doesn't run your hooks.
+# --no-session-persistence keeps it out of `claude --resume`, and
+# CQ_HOOK_DISABLED is a backstop against this hook recording it.
+summarize_title() {
+  local id="$1" token="$2" prompt="$3" summary
+  summary="$(
+    printf '%s' "$prompt" | head -c 2000 \
+      | CQ_HOOK_DISABLED=1 claude -p --model haiku --no-session-persistence \
+          --tools "" --strict-mcp-config --setting-sources "" \
+          --system-prompt "You write short titles for requests sent to a coding agent. You never carry out the request. Reply with a title of at most 6 words and nothing else: no quotes, no full stop." \
+          "Title this request." 2>/dev/null \
+      | head -n1 | sed -e 's/^["'\'' ]*//' -e 's/["'\''. ]*$//' | short_title
+  )"
+  [ -n "$summary" ] || return 0
+  cq_merge_state "$id" 'if .title_token == $token then .title = $summary else . end' \
+    --arg token "$token" --arg summary "$summary"
+}
+
 main() {
   local input event id cwd transcript now pid pid_started=""
   input="$(cat)"
@@ -107,13 +130,22 @@ main() {
     UserPromptSubmit)
       # Replying is the only thing that clears the flag: switching to the
       # window and away again leaves it set. The title is the latest prompt,
-      # shortened.
+      # shortened; long prompts then get a summary from Claude in the
+      # background. The token stops a slow summary from replacing a newer
+      # prompt's title.
+      local prompt token="$now-$RANDOM"
+      prompt="$(jq -r '.prompt // empty' <<<"$input")"
       update '.status = "working"
         | .updated_at = $now
         | .message = null
         | .snoozed_until = null
-        | .title = (if $title == "" then .title else $title end)' \
-        --arg title "$(jq -r '.prompt // empty' <<<"$input" | short_title)"
+        | .title = (if $title == "" then .title else $title end)
+        | .title_token = $token' \
+        --arg title "$(printf '%s' "$prompt" | short_title)" --arg token "$token"
+      if [ "${CQ_SUMMARIZE:-1}" != "0" ] && [ "${#prompt}" -gt 50 ]; then
+        summarize_title "$id" "$token" "$prompt" </dev/null >/dev/null 2>>"$CQ_DIR/hook-errors.log" &
+        disown
+      fi
       ;;
 
     Notification)
@@ -161,6 +193,10 @@ main() {
       ;;
   esac
 }
+
+# Set for the Claude that summarize_title runs, so its own session isn't
+# recorded.
+[ "${CQ_HOOK_DISABLED:-}" = "1" ] && exit 0
 
 mkdir -p "$CQ_DIR" 2>/dev/null
 main >/dev/null 2>>"$CQ_DIR/hook-errors.log"

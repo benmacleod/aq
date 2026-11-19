@@ -47,7 +47,7 @@ state() {
   state fresh new 5
   run bash "$SCRIPT"
   [ "$status" -eq 0 ]
-  ids="$(grep -o '\[zed [a-z-]*' <<<"$output" | cut -d' ' -f2)"
+  ids="$(grep -o '\[Zed [a-z-]*' <<<"$output" | cut -d' ' -f2)"
   [ "$ids" = "$(printf 'needs-ol\nneeds-ne\nidle-old\nbusy')" ]
 }
 
@@ -71,7 +71,7 @@ state() {
 @test "keeps empty fields in their columns" {
   state s1 idle 5 '.title = "" | .branch = ""'
   run bash "$SCRIPT"
-  [[ "$output" == *"[zed s1]"* ]]
+  [[ "$output" == *"[Zed s1]"* ]]
 }
 
 @test "open focuses the Zed window for a Zed session, by row number" {
@@ -99,12 +99,45 @@ state() {
   [[ "$output" == *"Accessibility permission"* ]]
 }
 
-@test "open copies the resume command for a CLI session outside tmux" {
-  state abc123 idle 5 '.entrypoint = "cli" | .term_program = "ghostty"'
+@test "open brings a terminal session's app forward and says which tab it's in" {
+  state abc123 idle 5 '.entrypoint = "cli" | .term_program = "Tabby" | .app = "org.tabby" | .tty = "ttys008"'
   run bash "$SCRIPT" open abc
   [ "$status" -eq 0 ]
-  [[ "$output" == *"claude --resume abc123"* ]]
-  grep -q "^pbcopy" "$MOCK_DIR/calls"
+  grep -q "^open -b org.tabby$" "$MOCK_DIR/calls"
+  [[ "$output" == *"is in Tabby (ttys008). Switch to its tab."* ]]
+  grep -q "^terminal-notifier" "$MOCK_DIR/calls"
+  # Resuming a live session would start a second Claude on it.
+  ! grep -q "^pbcopy" "$MOCK_DIR/calls"
+}
+
+@test "open brings forward a terminal recorded without a bundle ID by name" {
+  state abc123 idle 5 '.entrypoint = "cli" | .term_program = "ghostty"'
+  run bash "$SCRIPT" open abc
+  grep -q "^open -a ghostty$" "$MOCK_DIR/calls"
+}
+
+@test "open switches to a session's tmux pane" {
+  state abc123 idle 5 '.entrypoint = "cli" | .app = "org.tabby" | .tmux_pane = "%3"'
+  printf 'exit 0\n' >> "$MOCK_DIR/tmux"
+  run bash "$SCRIPT" open abc
+  [ "$status" -eq 0 ]
+  grep -q "^tmux select-pane -t %3$" "$MOCK_DIR/calls"
+  ! grep -q "^terminal-notifier" "$MOCK_DIR/calls"
+}
+
+@test "shows each session's app" {
+  state zed idle 5
+  state tabby idle 5 '.entrypoint = "cli" | .app = "org.tabby"'
+  state tabby-old idle 5 '.entrypoint = "cli" | .term_program = "Tabby"'
+  state other idle 5 '.entrypoint = "cli" | .app = "com.mitchellh.ghostty" | .term_program = "ghostty"'
+  run bash "$SCRIPT" --swiftbar
+  [[ "$output" == *"⚡⚪ "*"param2=zed "* ]]
+  [[ "$output" == *"🐈⚪ "*"param2=tabby "* ]]
+  [[ "$output" == *"🐈⚪ "*"param2=tabby-old "* ]]
+  [[ "$output" == *"💻⚪ "*"param2=other "*'tooltip="Running in ghostty.'* ]]
+  run bash "$SCRIPT"
+  [[ "$output" == *"[Tabby tabby]"* ]]
+  [[ "$output" == *"[ghostty other]"* ]]
 }
 
 @test "open fails when the directory has gone" {
@@ -160,7 +193,7 @@ state() {
   run bash "$SCRIPT" --swiftbar
   [ "$status" -eq 0 ]
   [ "${lines[0]}" = "🟠 1 ⚪ 1" ]
-  [[ "$output" == *"🟠 "*" · title s1 | bash="*"param1=open param2=s1"*'tooltip="Needs  permission. Option-click to dismiss"'* ]]
+  [[ "$output" == *"🟠 "*" · title s1 | bash="*"param1=open param2=s1"*'tooltip="Needs  permission. Running in Zed. Option-click to dismiss"'* ]]
   [[ "$output" == *"✕ Dismiss: "*"title s2 | bash="*"param1=dismiss param2=s2"*"alternate=true"* ]]
   [[ "$output" != *"param1=snooze"* ]]
   [[ "$output" != *"length="* ]]
@@ -170,7 +203,7 @@ state() {
   # SwiftBar drops the submenu of an item whose text changes between runs.
   state s1 idle 5
   run bash "$SCRIPT" --swiftbar
-  session_line="$(grep -n '^⚪ .*param1=open' <<<"$output" | cut -d: -f1)"
+  session_line="$(grep -n '⚪ .*param1=open' <<<"$output" | cut -d: -f1)"
   [ -n "$session_line" ]
   next="$(sed -n "$((session_line + 1))p" <<<"$output")"
   [[ "$next" == "---" || "$next" != --* ]]
@@ -210,7 +243,7 @@ state() {
 @test "--swiftbar shortens long titles itself" {
   state s1 idle 5 ".title = \"$(printf 'x%.0s' {1..120})\""
   run bash "$SCRIPT" --swiftbar
-  line="$(grep '^⚪' <<<"$output")"
+  line="$(grep 'param1=open' <<<"$output")"
   [[ "$line" == *"… | bash="* ]]
   [[ "$line" != *"$(printf 'x%.0s' {1..80})"* ]]
 }

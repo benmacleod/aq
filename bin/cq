@@ -33,9 +33,17 @@ Commands:
 EOF
 }
 
+# The apps cq knows, by bundle ID: the name and emoji to show, and how to
+# switch to a session (see cmd_open). Other apps get 💻 and their
+# TERM_PROGRAM as a name, and cq just brings them to the front.
+APPS='{
+  "dev.zed.Zed": {"name": "Zed", "emoji": "⚡", "open": "zed-window"},
+  "org.tabby": {"name": "Tabby", "emoji": "🐈"}
+}'
+
 # jq with the definitions the commands share.
 cq_jq() {
-  jq --argjson now "$NOW" --arg home "$HOME" "$@"
+  jq --argjson now "$NOW" --arg home "$HOME" --argjson apps "$APPS" "$@"
 }
 
 JQ_DEFS='
@@ -46,7 +54,18 @@ JQ_DEFS='
       else "\($s / 86400 | floor)d" end;
   def place: (.cwd // "?") | sub("^" + $home + "/Code/"; "") | sub("^" + $home; "~");
   def title: .title // "" | select(. != "");
-  def source: if .entrypoint == "cli" then (if .term_program == "zed" then "cli (zed)" else "cli" end) else "zed" end;
+  # The app the session runs in: {name, emoji, open}. Sessions recorded
+  # before cq-hook stored the bundle ID are matched on TERM_PROGRAM, and
+  # are Zed if they ran in no terminal.
+  def app:
+    (.app // "") as $id
+    | (.term_program // "") as $term
+    | ([$apps[] | select(.name == $term)] | first) as $by_name
+    | if $apps[$id] then $apps[$id]
+      elif $id == "" and $by_name then $by_name
+      elif $id == "" and (.entrypoint != "cli" or $term == "zed") then $apps["dev.zed.Zed"]
+      else {name: ([$term, $id, "terminal"] | map(select(. != "")) | first), emoji: "💻"}
+      end;
   def rank: {"needs-input": 0, "idle": 1, "working": 2}[.status // ""] // 3;
   # "new" is a session nobody has prompted yet, e.g. a Zed thread you opened
   # but never typed into.
@@ -119,7 +138,7 @@ cmd_list() {
   rows="$(states_json "$all" | cq_jq -r "$JQ_DEFS
     to_entries[]
     | [(.key + 1), .value.status, (.value.updated_at | age), (.value | place),
-       (.value.branch // \"\"), (.value | source), (.value | title // \"\"),
+       (.value.branch // \"\"), (.value | app | .name), (.value | title // \"\"),
        (.value.message // \"\"), .value.session_id[0:8]]
     | map(tostring | gsub(\"[\\u001f\\n]\"; \" \")) | join(\"\\u001f\")")"
   if [ -z "$rows" ]; then
@@ -190,34 +209,38 @@ EOF
 
 cmd_open() {
   [ $# -ge 1 ] || { usage >&2; exit 1; }
-  local id cwd entrypoint term_program tmux_pane
+  local id cwd place bundle name how tmux_pane tty
   id="$(resolve "$1")"
-  IFS=$'\x1f' read -r cwd entrypoint term_program tmux_pane < <(jq -r '
-    [.cwd, .entrypoint, .term_program, .tmux_pane]
-    | map(. // "") | join("\u001f")' "$(cq_state_file "$id")")
+  IFS=$'\x1f' read -r cwd place bundle name how tmux_pane tty < <(cq_jq -r "$JQ_DEFS
+    [.cwd, place, .app, (app | .name), (app | .open), .tmux_pane, .tty]
+    | map(. // \"\") | join(\"\\u001f\")" "$(cq_state_file "$id")")
 
   if [ -z "$cwd" ] || [ ! -d "$cwd" ]; then
-    echo "The session's directory ($cwd) no longer exists. Try: cq prune" >&2
+    complain "The session's directory ($cwd) no longer exists. Try: cq prune"
     exit 1
   fi
 
-  # Zed agent threads, and CLI sessions in Zed's terminal.
-  if [ "$entrypoint" != "cli" ] || [ "$term_program" = "zed" ]; then
+  if [ "$how" = "zed-window" ]; then
     focus_zed_window "$(basename "$cwd")"
     return
+  fi
+
+  # Bring the app forward. With no bundle ID (a session recorded before
+  # cq-hook stored it), try the app's name.
+  if [ -n "$bundle" ]; then
+    open -b "$bundle" 2>/dev/null || true
+  else
+    open -a "$name" 2>/dev/null || true
   fi
 
   if [ -n "$tmux_pane" ] && tmux has-session -t "$tmux_pane" 2>/dev/null; then
     tmux switch-client -t "$tmux_pane" 2>/dev/null || true
     tmux select-window -t "$tmux_pane" && tmux select-pane -t "$tmux_pane"
-    [ -n "$term_program" ] && open -a "$term_program" 2>/dev/null || true
     return 0
   fi
 
-  local cmd
-  cmd="cd $(printf '%q' "$cwd") && claude --resume $id"
-  printf '%s' "$cmd" | pbcopy
-  echo "Copied to the clipboard: $cmd"
+  # Most terminals can't be told to switch tabs, so say which tab to pick.
+  complain "$place is in $name${tty:+ ($tty)}. Switch to its tab."
 }
 
 cmd_snooze() {
@@ -259,7 +282,11 @@ cmd_swiftbar() {
     def clean: gsub(\"[|\\\"]\"; \"\");
     def trunc(\$n): if length > \$n then .[0:\$n - 1] + \"…\" else . end;
     def run(\$cmd; \$id): \" | bash=\" + \$cq + \" param1=\" + \$cmd + (\$id | if . then \" param2=\" + . else \"\" end) + \" terminal=false refresh=true\";
-    def tooltip: [.message // \"\" | select(. != \"\"), \"Option-click to dismiss\"] | join(\". \") | clean;
+    def tooltip:
+      [(.message // \"\" | select(. != \"\")),
+       \"Running in \(app | .name)\" + (.tty // \"\" | if . == \"\" then \"\" else \" (\(.))\" end),
+       \"Option-click to dismiss\"]
+      | join(\". \") | clean;
     ([.[] | select(.status == \"needs-input\")] | length) as \$needs
     | ([.[] | select(.status == \"idle\")] | length) as \$idle
     | ([if \$needs > 0 then \"🟠 \(\$needs)\" else empty end, if \$idle > 0 then \"⚪ \(\$idle)\" else empty end]
@@ -267,7 +294,7 @@ cmd_swiftbar() {
       \"---\",
       (.[]
         | ({\"needs-input\": \"🟠\", \"working\": \"🔵\"}[.status] // \"⚪\") as \$icon
-        | \"\(\$icon) \([place, (.updated_at | age), title] | join(\" · \") | clean | trunc(80))\"
+        | \"\(app | .emoji)\(\$icon) \([place, (.updated_at | age), title] | join(\" · \") | clean | trunc(80))\"
             + run(\"open\"; .session_id) + \" tooltip=\\\"\(tooltip)\\\"\",
           \"✕ Dismiss: \([place, title] | join(\" · \") | clean | trunc(70))\"
             + run(\"dismiss\"; .session_id) + \" alternate=true\"),

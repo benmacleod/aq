@@ -84,22 +84,43 @@ main() {
   transcript="$(jq -r '.transcript_path // empty' <<<"$input")"
   now="$(cq_now)"
 
-  # The Claude process, so cq can drop the session once it has gone. Zed
-  # doesn't always send SessionEnd when you close a thread.
+  # The Claude process, so cq can drop the session once it has gone (Zed
+  # doesn't always send SessionEnd when you close a thread), and its
+  # terminal, so cq can tell you which tab it's in.
+  local tty=""
   pid="$(claude_pid)"
-  [ -n "$pid" ] && pid_started="$(cq_process_started "$pid")"
+  if [ -n "$pid" ]; then
+    pid_started="$(cq_process_started "$pid")"
+    tty="$(ps -o tty= -p "$pid" | tr -d ' ')"
+    [ "$tty" = "??" ] && tty=""
+  fi
 
   # update <jq filter> [jq args...]: applies the filter after refreshing the
-  # fields every event sets.
+  # fields every event sets. Fields with no value this time keep their old
+  # one.
+  #
+  # app is the bundle ID of the app Claude runs in (e.g. dev.zed.Zed,
+  # org.tabby), which macOS passes to every process the app starts.
   update() {
     cq_merge_state "$id" "
+      def keep(\$new): if \$new == \"\" then . else \$new end;
       .session_id = \$id
-      | .cwd = (if \$cwd == \"\" then .cwd else \$cwd end)
-      | .transcript_path = (if \$transcript == \"\" then .transcript_path else \$transcript end)
+      | .cwd |= keep(\$cwd)
+      | .transcript_path |= keep(\$transcript)
+      | .app |= keep(\$app)
+      | .entrypoint |= keep(\$entrypoint)
+      | .term_program |= keep(\$term_program)
+      | .tmux_pane |= keep(\$tmux_pane)
+      | .tty |= keep(\$tty)
       | .started_at = (.started_at // \$now)
       | if \$pid == \"\" then . else .pid = (\$pid | tonumber) | .pid_started = \$pid_started end
       | $1" \
       --arg id "$id" --arg cwd "$cwd" --arg transcript "$transcript" --argjson now "$now" \
+      --arg app "${__CFBundleIdentifier:-}" \
+      --arg entrypoint "${CLAUDE_CODE_ENTRYPOINT:-}" \
+      --arg term_program "${TERM_PROGRAM:-}" \
+      --arg tmux_pane "${TMUX_PANE:-}" \
+      --arg tty "$tty" \
       --arg pid "$pid" --arg pid_started "$pid_started" "${@:2}"
   }
 
@@ -117,14 +138,8 @@ main() {
       # whether or not you ever type into it. cq hides these.
       update '.status = (.status // "new")
         | .updated_at = (.updated_at // $now)
-        | .branch = $branch
-        | .entrypoint = $entrypoint
-        | .term_program = $term_program
-        | .tmux_pane = $tmux_pane' \
-        --arg branch "$(branch)" \
-        --arg entrypoint "${CLAUDE_CODE_ENTRYPOINT:-}" \
-        --arg term_program "${TERM_PROGRAM:-}" \
-        --arg tmux_pane "${TMUX_PANE:-}"
+        | .branch = $branch' \
+        --arg branch "$(branch)"
       ;;
 
     UserPromptSubmit)

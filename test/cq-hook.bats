@@ -188,3 +188,14 @@ field() {
   [ "$pid" != "null" ]
   [ -n "$(field pid_started)" ]
 }
+
+@test "records the app Claude runs in, and keeps it when an event has none" {
+  printf '{"hook_event_name":"SessionStart","session_id":"s1"}' \
+    | __CFBundleIdentifier=org.tabby TERM_PROGRAM=Tabby bash "$HOOK"
+  [ "$(field app)" = "org.tabby" ]
+  [ "$(field term_program)" = "Tabby" ]
+  printf '{"hook_event_name":"Stop","session_id":"s1"}' \
+    | env -u __CFBundleIdentifier -u TERM_PROGRAM bash "$HOOK"
+  [ "$(field app)" = "org.tabby" ]
+  [ "$(field term_program)" = "Tabby" ]
+}

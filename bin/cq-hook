@@ -1,0 +1,167 @@
+#!/usr/bin/env bash
+#
+# Claude Code hook handler for cq. Reads the hook's JSON from stdin and
+# records the session's state in ~/.claude/attention/<session_id>.json.
+#
+# Hook it up in ~/.claude/settings.json for SessionStart, UserPromptSubmit,
+# Notification, Stop, SessionEnd, PreToolUse (AskUserQuestion|ExitPlanMode)
+# and PostToolUse. See the README.
+#
+# It always exits 0 and prints nothing: a hook's stdout can end up in
+# Claude's context, and a failing hook mustn't get in Claude's way. Errors go
+# to $CQ_DIR/hook-errors.log.
+
+set -uo pipefail
+
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/cq.sh"
+
+# Prints the PID of the Claude process running this hook: the nearest
+# ancestor whose command mentions claude. Claude may start the hook through
+# a shell, so $PPID alone isn't enough.
+claude_pid() {
+  local pid="$PPID" i
+  for i in 1 2 3 4 5; do
+    [ -n "$pid" ] && [ "$pid" -gt 1 ] || return 0
+    if ps -o command= -p "$pid" | grep -q claude; then
+      echo "$pid"
+      return 0
+    fi
+    pid="$(ps -o ppid= -p "$pid" | tr -d ' ')"
+  done
+}
+
+short_title() {
+  tr '\n\t' '  ' | sed -e 's/  */ /g' -e 's/^ //' -e 's/ $//' | cut -c1-70
+}
+
+title_from_transcript() {
+  [ -f "$1" ] || return 0
+  grep -m1 '"type":"user"' "$1" \
+    | jq -r '.message.content
+             | if type == "string" then . else (map(select(.type == "text").text) | first // "") end' \
+    2>/dev/null
+}
+
+# A plainer message for the tools that wait for you. Some clients (e.g. Zed)
+# also ask permission for them, with a message naming the tool.
+waiting_message() {
+  case "$1" in
+    AskUserQuestion) echo "Asking you a question" ;;
+    ExitPlanMode) echo "Waiting for plan approval" ;;
+  esac
+}
+
+main() {
+  local input event id cwd transcript now pid pid_started=""
+  input="$(cat)"
+  event="$(jq -r '.hook_event_name // empty' <<<"$input")"
+  id="$(jq -r '.session_id // empty' <<<"$input")"
+  [ -n "$id" ] || return 0
+  cwd="$(jq -r '.cwd // empty' <<<"$input")"
+  transcript="$(jq -r '.transcript_path // empty' <<<"$input")"
+  now="$(cq_now)"
+
+  # The Claude process, so cq can drop the session once it has gone. Zed
+  # doesn't always send SessionEnd when you close a thread.
+  pid="$(claude_pid)"
+  [ -n "$pid" ] && pid_started="$(cq_process_started "$pid")"
+
+  # update <jq filter> [jq args...]: applies the filter after refreshing the
+  # fields every event sets.
+  update() {
+    cq_merge_state "$id" "
+      .session_id = \$id
+      | .cwd = (if \$cwd == \"\" then .cwd else \$cwd end)
+      | .transcript_path = (if \$transcript == \"\" then .transcript_path else \$transcript end)
+      | .started_at = (.started_at // \$now)
+      | if \$pid == \"\" then . else .pid = (\$pid | tonumber) | .pid_started = \$pid_started end
+      | $1" \
+      --arg id "$id" --arg cwd "$cwd" --arg transcript "$transcript" --argjson now "$now" \
+      --arg pid "$pid" --arg pid_started "$pid_started" "${@:2}"
+  }
+
+  needs_input() {
+    update '.status = "needs-input" | .updated_at = $now | .message = $message' --arg message "$1"
+  }
+
+  branch() {
+    git -C "$cwd" branch --show-current 2>/dev/null || true
+  }
+
+  case "$event" in
+    SessionStart)
+      # "new" until the first prompt: Zed starts a session for a thread
+      # whether or not you ever type into it. cq hides these.
+      update '.status = (.status // "new")
+        | .updated_at = (.updated_at // $now)
+        | .branch = $branch
+        | .entrypoint = $entrypoint
+        | .term_program = $term_program
+        | .tmux_pane = $tmux_pane' \
+        --arg branch "$(branch)" \
+        --arg entrypoint "${CLAUDE_CODE_ENTRYPOINT:-}" \
+        --arg term_program "${TERM_PROGRAM:-}" \
+        --arg tmux_pane "${TMUX_PANE:-}"
+      ;;
+
+    UserPromptSubmit)
+      # Replying is the only thing that clears the flag: switching to the
+      # window and away again leaves it set. The title is the latest prompt,
+      # shortened.
+      update '.status = "working"
+        | .updated_at = $now
+        | .message = null
+        | .snoozed_until = null
+        | .title = (if $title == "" then .title else $title end)' \
+        --arg title "$(jq -r '.prompt // empty' <<<"$input" | short_title)"
+      ;;
+
+    Notification)
+      # idle_prompt fires after Claude has sat idle for a minute. Stop already
+      # marked the session idle, so it adds nothing.
+      [ "$(jq -r '.notification_type // empty' <<<"$input")" = "idle_prompt" ] && return 0
+      local message plain
+      message="$(jq -r '.message // empty' <<<"$input")"
+      # e.g. "Claude needs your permission to use AskUserQuestion"
+      plain="$(waiting_message "${message##* }")"
+      needs_input "${plain:-$message}"
+      ;;
+
+    PreToolUse)
+      local message
+      message="$(waiting_message "$(jq -r '.tool_name // empty' <<<"$input")")"
+      [ -n "$message" ] && needs_input "$message"
+      ;;
+
+    PostToolUse)
+      # A tool ran, so any permission prompt or question has been answered.
+      # Only write on that change, since this fires after every tool call.
+      local file
+      file="$(cq_state_file "$id")"
+      [ -f "$file" ] && [ "$(jq -r '.status' "$file")" = "needs-input" ] || return 0
+      update '.status = "working" | .updated_at = $now | .message = null'
+      ;;
+
+    Stop)
+      # The title comes from the transcript if the session has none, e.g.
+      # because it started before these hooks were set up.
+      local title=""
+      [ -n "$(jq -r '.title // empty' "$(cq_state_file "$id")" 2>/dev/null)" ] \
+        || title="$(title_from_transcript "$transcript" | short_title)"
+      update '.status = "idle"
+        | .updated_at = $now
+        | .message = null
+        | .branch = (if $branch == "" then .branch else $branch end)
+        | .title = (if (.title // "") == "" then $title else .title end)' \
+        --arg branch "$(branch)" --arg title "$title"
+      ;;
+
+    SessionEnd)
+      rm -f "$(cq_state_file "$id")"
+      ;;
+  esac
+}
+
+mkdir -p "$CQ_DIR" 2>/dev/null
+main >/dev/null 2>>"$CQ_DIR/hook-errors.log"
+exit 0

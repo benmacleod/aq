@@ -1,0 +1,290 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+source "$(dirname "$SELF")/../lib/cq.sh"
+
+NOW="$(cq_now)"
+
+usage() {
+  cat <<EOF
+Usage: $(basename "$0") [command] [args]
+
+Lists your Claude sessions, the ones waiting for you first. cq-hook records
+the state; a session stays flagged until you reply to it.
+
+Commands:
+  list [-a]             List sessions that need input, then idle ones, then
+                        working ones, oldest first. -a also shows snoozed
+                        sessions, and ones you haven't prompted yet. This is
+                        the default.
+  open <n|id>           Switch to the session: focus its Zed window, or its
+                        tmux pane, or copy its resume command.
+  snooze <n|id> [dur]   Hide the session for a while (e.g. 30m, 2h, 1d).
+                        The default is 1h.
+  dismiss <n|id>        Take the session off the list. It comes back when
+                        you next send it a prompt.
+  prune [days]          Remove sessions whose directory or Claude process
+                        has gone, and sessions untouched for longer than
+                        <days> (default \$CQ_PRUNE_DAYS or 3).
+  --swiftbar            Print the list in SwiftBar's menu format.
+
+<n> is a row number from the list. <id> is a session ID or a prefix of one.
+EOF
+}
+
+# jq with the definitions the commands share.
+cq_jq() {
+  jq --argjson now "$NOW" --arg home "$HOME" "$@"
+}
+
+JQ_DEFS='
+  def age: ($now - .) as $s
+    | if $s < 60 then "now"
+      elif $s < 3600 then "\($s / 60 | floor)m"
+      elif $s < 86400 then "\($s / 3600 | floor)h"
+      else "\($s / 86400 | floor)d" end;
+  def place: (.cwd // "?") | sub("^" + $home + "/Code/"; "") | sub("^" + $home; "~");
+  def title: .title // "" | select(. != "");
+  def source: if .entrypoint == "cli" then (if .term_program == "zed" then "cli (zed)" else "cli" end) else "zed" end;
+  def rank: {"needs-input": 0, "idle": 1, "working": 2}[.status // ""] // 3;
+  # "new" is a session nobody has prompted yet, e.g. a Zed thread you opened
+  # but never typed into.
+  def visible($all):
+    map(select($all or (.status != "new" and ((.snoozed_until // 0) <= $now))))
+    | sort_by([rank, .updated_at]);
+'
+
+# remove_stale [days]
+#
+# Deletes the state of sessions whose directory has gone, or whose recorded
+# Claude process has exited (or whose PID now belongs to another process).
+# Given <days>, also deletes sessions untouched for that long, and ones
+# working or never prompted for over a day: they never sent Stop or
+# SessionEnd. Prints a line per session it removes.
+remove_stale() {
+  local days="${1:-}" f id cwd status updated pid pid_started reason
+  for f in "$CQ_DIR"/*.json; do
+    [ -e "$f" ] || continue
+    IFS=$'\x1f' read -r id cwd status updated pid pid_started < <(jq -r '
+      [.session_id, .cwd, .status, (.updated_at // 0), .pid, .pid_started]
+      | map(. // "" | tostring) | join("\u001f")' "$f")
+    reason=""
+    if [ -z "$cwd" ] || [ ! -d "$cwd" ]; then
+      reason="directory gone"
+    elif [ -n "$pid" ] && [ "$(cq_process_started "$pid")" != "$pid_started" ]; then
+      reason="Claude process gone"
+    elif [ -n "$days" ] && [[ "$status" =~ ^(working|new)$ ]] && [ "$updated" -lt $((NOW - 86400)) ]; then
+      reason="$status for over a day"
+    elif [ -n "$days" ] && [ "$updated" -lt $((NOW - days * 86400)) ]; then
+      reason="untouched for over $days days"
+    fi
+    if [ -n "$reason" ]; then
+      rm -f "$f"
+      echo "Removed ${id:0:8} ($cwd): $reason"
+    fi
+  done
+}
+
+# The sessions to show, as a JSON array, after dropping those that have gone.
+states_json() {
+  local files
+  remove_stale >/dev/null
+  files=("$CQ_DIR"/*.json)
+  { [ -e "${files[0]}" ] && cat "${files[@]}" || true; } \
+    | cq_jq -s --argjson all "$1" "$JQ_DEFS visible(\$all)"
+}
+
+# Turns a row number or session ID prefix into a session ID.
+resolve() {
+  local ref="$1" matches=() f
+  if [[ "$ref" =~ ^[0-9]{1,3}$ ]]; then
+    states_json false | jq -er --argjson n "$ref" '.[$n - 1].session_id // empty' \
+      || { echo "No row $ref" >&2; return 1; }
+    return
+  fi
+  for f in "$CQ_DIR/$ref"*.json; do
+    [ -e "$f" ] && matches+=("$(basename "$f" .json)")
+  done
+  case "${#matches[@]}" in
+    1) echo "${matches[0]}" ;;
+    0) echo "No session matches $ref" >&2; return 1 ;;
+    *) echo "More than one session matches $ref" >&2; return 1 ;;
+  esac
+}
+
+cmd_list() {
+  local all=false rows
+  [ "${1:-}" = "-a" ] && all=true
+  rows="$(states_json "$all" | cq_jq -r "$JQ_DEFS
+    to_entries[]
+    | [(.key + 1), .value.status, (.value.updated_at | age), (.value | place),
+       (.value.branch // \"\"), (.value | source), (.value | title // \"\"),
+       (.value.message // \"\"), .value.session_id[0:8]]
+    | map(tostring | gsub(\"[\\u001f\\n]\"; \" \")) | join(\"\\u001f\")")"
+  if [ -z "$rows" ]; then
+    echo "Nothing waiting for you."
+    return 0
+  fi
+  local n status age place branch src title message short icon
+  # \x1f rather than a tab, because read collapses runs of whitespace IFS
+  # characters, which would lose empty fields.
+  while IFS=$'\x1f' read -r n status age place branch src title message short; do
+    case "$status" in
+      needs-input) icon=$'\033[0;33m●\033[0m' ;;
+      idle) icon=$'\033[2m○\033[0m' ;;
+      working) icon=$'\033[0;34m●\033[0m' ;;
+      *) icon=$'\033[2m…\033[0m' ;;
+    esac
+    printf '%2s %s %-4s %s' "$n" "$icon" "$age" "$place"
+    if [ -n "$branch" ]; then printf ' \033[2m(%s)\033[0m' "$branch"; fi
+    printf ' \033[2m[%s %s]\033[0m\n' "$src" "$short"
+    if [ -n "$title" ]; then printf '        %s\n' "$title"; fi
+    if [ -n "$message" ]; then printf '        \033[0;33m%s\033[0m\n' "$message"; fi
+  done <<<"$rows"
+}
+
+# Prints a message, and also shows it as a notification, since nobody sees
+# the output when SwiftBar runs cq.
+complain() {
+  echo "$1" >&2
+  terminal-notifier -title cq -message "$1" -group cq >/dev/null 2>&1 || true
+}
+
+# Brings forward the Zed window for a project folder, by window title. The
+# zed CLI can't do this: `zed <dir>` opens a new window when
+# cli_default_open_behavior is "new_window", and `zed -e <dir>` opens the
+# folder in whichever window is current. Zed titles a window after its
+# project folder, e.g. "tc-5031 — README.md".
+#
+# Needs Accessibility permission for whatever runs cq: SwiftBar, or your
+# terminal.
+focus_zed_window() {
+  local name="$1" result
+  result="$(osascript - "$name" 2>&1 <<'EOF'
+on run argv
+  set folderName to item 1 of argv
+  tell application "System Events"
+    if not (exists process "Zed") then return "no-zed"
+    tell process "Zed"
+      set matches to (every window whose name is folderName or name starts with (folderName & " "))
+      if matches is {} then return "no-window"
+      perform action "AXRaise" of item 1 of matches
+      set frontmost to true
+    end tell
+  end tell
+  return "ok"
+end run
+EOF
+)"
+  case "$result" in
+    ok) return 0 ;;
+    no-zed) complain "Zed isn't running." ;;
+    no-window) complain "No Zed window is open on $name." ;;
+    *assistive\ access*|*-1719*|*-25211*)
+      complain "cq needs Accessibility permission to switch Zed windows. Add SwiftBar (or your terminal) in System Settings > Privacy & Security > Accessibility." ;;
+    *) complain "Couldn't switch to the Zed window for $name: $result" ;;
+  esac
+  return 1
+}
+
+cmd_open() {
+  [ $# -ge 1 ] || { usage >&2; exit 1; }
+  local id cwd entrypoint term_program tmux_pane
+  id="$(resolve "$1")"
+  IFS=$'\x1f' read -r cwd entrypoint term_program tmux_pane < <(jq -r '
+    [.cwd, .entrypoint, .term_program, .tmux_pane]
+    | map(. // "") | join("\u001f")' "$(cq_state_file "$id")")
+
+  if [ -z "$cwd" ] || [ ! -d "$cwd" ]; then
+    echo "The session's directory ($cwd) no longer exists. Try: cq prune" >&2
+    exit 1
+  fi
+
+  # Zed agent threads, and CLI sessions in Zed's terminal.
+  if [ "$entrypoint" != "cli" ] || [ "$term_program" = "zed" ]; then
+    focus_zed_window "$(basename "$cwd")"
+    return
+  fi
+
+  if [ -n "$tmux_pane" ] && tmux has-session -t "$tmux_pane" 2>/dev/null; then
+    tmux switch-client -t "$tmux_pane" 2>/dev/null || true
+    tmux select-window -t "$tmux_pane" && tmux select-pane -t "$tmux_pane"
+    [ -n "$term_program" ] && open -a "$term_program" 2>/dev/null || true
+    return 0
+  fi
+
+  local cmd
+  cmd="cd $(printf '%q' "$cwd") && claude --resume $id"
+  printf '%s' "$cmd" | pbcopy
+  echo "Copied to the clipboard: $cmd"
+}
+
+cmd_snooze() {
+  [ $# -ge 1 ] || { usage >&2; exit 1; }
+  local id dur="${2:-1h}" unit
+  id="$(resolve "$1")"
+  if ! [[ "$dur" =~ ^([0-9]+)([mhd])$ ]]; then
+    echo "Can't read duration $dur. Use e.g. 30m, 2h or 1d." >&2
+    exit 1
+  fi
+  case "${BASH_REMATCH[2]}" in m) unit=60 ;; h) unit=3600 ;; d) unit=86400 ;; esac
+  cq_merge_state "$id" '.snoozed_until = $until' \
+    --argjson until "$((NOW + BASH_REMATCH[1] * unit))"
+  echo "Snoozed ${id:0:8} for $dur"
+}
+
+cmd_dismiss() {
+  [ $# -ge 1 ] || { usage >&2; exit 1; }
+  local id
+  id="$(resolve "$1")"
+  rm -f "$(cq_state_file "$id")"
+  echo "Dismissed ${id:0:8}"
+}
+
+cmd_prune() {
+  local removed
+  removed="$(remove_stale "${1:-${CQ_PRUNE_DAYS:-3}}")"
+  [ -n "$removed" ] && echo "$removed"
+  echo "Pruned $(grep -c . <<<"$removed" || true) session(s)."
+}
+
+# One line per session, with no submenus: SwiftBar loses an item's submenu
+# when the item's text changes between runs (and session lines change every
+# minute), leaving it disabled. Clicking a line opens the session; holding
+# Option swaps in an alternate line that dismisses it. Text is shortened
+# here, because SwiftBar's own length param also broke submenus.
+cmd_swiftbar() {
+  states_json false | cq_jq -r --arg cq "$SELF" "$JQ_DEFS
+    def clean: gsub(\"[|\\\"]\"; \"\");
+    def trunc(\$n): if length > \$n then .[0:\$n - 1] + \"…\" else . end;
+    def run(\$cmd; \$id): \" | bash=\" + \$cq + \" param1=\" + \$cmd + (\$id | if . then \" param2=\" + . else \"\" end) + \" terminal=false refresh=true\";
+    def tooltip: [.message // \"\" | select(. != \"\"), \"Option-click to dismiss\"] | join(\". \") | clean;
+    ([.[] | select(.status == \"needs-input\")] | length) as \$needs
+    | ([.[] | select(.status == \"idle\")] | length) as \$idle
+    | ([if \$needs > 0 then \"🟠 \(\$needs)\" else empty end, if \$idle > 0 then \"⚪ \(\$idle)\" else empty end]
+       | if . == [] then \"✓\" else join(\" \") end),
+      \"---\",
+      (.[]
+        | ({\"needs-input\": \"🟠\", \"working\": \"🔵\"}[.status] // \"⚪\") as \$icon
+        | \"\(\$icon) \([place, (.updated_at | age), title] | join(\" · \") | clean | trunc(80))\"
+            + run(\"open\"; .session_id) + \" tooltip=\\\"\(tooltip)\\\"\",
+          \"✕ Dismiss: \([place, title] | join(\" · \") | clean | trunc(70))\"
+            + run(\"dismiss\"; .session_id) + \" alternate=true\"),
+      \"---\",
+      \"Prune stale sessions\" + run(\"prune\"; null),
+      \"Refresh | refresh=true\"
+  "
+}
+
+case "${1:-list}" in
+  list) shift || true; cmd_list "$@" ;;
+  -a) cmd_list -a ;;
+  open) shift; cmd_open "$@" ;;
+  snooze) shift; cmd_snooze "$@" ;;
+  dismiss) shift; cmd_dismiss "$@" ;;
+  prune) shift; cmd_prune "$@" ;;
+  --swiftbar) cmd_swiftbar ;;
+  -h|--help|help) usage ;;
+  *) usage >&2; exit 1 ;;
+esac

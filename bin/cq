@@ -228,6 +228,16 @@ cmd_list() {
   done <<<"$rows"
 }
 
+# The export statements that give an opener the session's details.
+#
+# This stays in single quotes, outside any $(...): bash 3.2, which SwiftBar
+# runs plugins with, brace-expands a {a, b} inside a double-quoted string
+# inside $(...), which split this into several jq programs.
+OPENER_ENV='
+  {CQ_SESSION_ID: .session_id, CQ_CWD: .cwd, CQ_PLACE: place, CQ_TTY: .tty,
+   CQ_APP: app.id, CQ_APP_NAME: app.name}
+  | to_entries[] | "export \(.key)=\(.value // "" | @sh)"'
+
 # run_opener <name> <session JSON>
 #
 # Runs the opener called <name>: an executable in $CQ_CONFIG_DIR/openers, or
@@ -246,14 +256,10 @@ run_opener() {
     notify "There's no cq opener called $name. Add one to $CQ_CONFIG_DIR/openers."
     return 1
   fi
+  local exports
+  exports="$(cq_jq -r "$JQ_DEFS $OPENER_ENV" <<<"$session")"
   status=0
-  output="$(
-    eval "$(cq_jq -r "$JQ_DEFS
-      {CQ_SESSION_ID: .session_id, CQ_CWD: .cwd, CQ_PLACE: place, CQ_TTY: .tty,
-       CQ_APP: app.id, CQ_APP_NAME: app.name}
-      | to_entries[] | \"export \(.key)=\(.value // \"\" | @sh)\"" <<<"$session")"
-    "$opener"
-  )" || status=$?
+  output="$(eval "$exports"; "$opener")" || status=$?
   [ -n "$output" ] && notify "$output"
   return "$status"
 }

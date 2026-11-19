@@ -39,7 +39,7 @@ wait_for_title() {
 LONG_PROMPT="Please look into why the newsletter footer links fail the contrast check in dark mode"
 
 hook() {
-  printf '%s' "$1" | bash "$HOOK"
+  printf '%s' "$1" | /bin/bash "$HOOK"
 }
 
 field() {
@@ -48,7 +48,7 @@ field() {
 
 @test "SessionStart records the session as new, with its entrypoint" {
   printf '{"hook_event_name":"SessionStart","session_id":"s1","cwd":"%s"}' "$REPO" \
-    | CLAUDE_CODE_ENTRYPOINT=sdk-ts bash "$HOOK"
+    | CLAUDE_CODE_ENTRYPOINT=sdk-ts /bin/bash "$HOOK"
   [ "$(field status)" = "new" ]
   [ "$(field cwd)" = "$REPO" ]
   [ "$(field entrypoint)" = "sdk-ts" ]
@@ -191,11 +191,11 @@ field() {
 
 @test "records the app Claude runs in, and keeps it when an event has none" {
   printf '{"hook_event_name":"SessionStart","session_id":"s1"}' \
-    | __CFBundleIdentifier=org.tabby TERM_PROGRAM=Tabby bash "$HOOK"
+    | __CFBundleIdentifier=org.tabby TERM_PROGRAM=Tabby /bin/bash "$HOOK"
   [ "$(field app)" = "org.tabby" ]
   [ "$(field term_program)" = "Tabby" ]
   printf '{"hook_event_name":"Stop","session_id":"s1"}' \
-    | env -u __CFBundleIdentifier -u TERM_PROGRAM bash "$HOOK"
+    | env -u __CFBundleIdentifier -u TERM_PROGRAM /bin/bash "$HOOK"
   [ "$(field app)" = "org.tabby" ]
   [ "$(field term_program)" = "Tabby" ]
 }

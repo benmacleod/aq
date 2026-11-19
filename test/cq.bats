@@ -50,7 +50,7 @@ state() {
 }
 
 @test "says so when nothing is waiting" {
-  run bash "$SCRIPT"
+  run /bin/bash "$SCRIPT"
   [ "$status" -eq 0 ]
   [ "$output" = "Nothing waiting for you." ]
 }
@@ -61,7 +61,7 @@ state() {
   state needs-new needs-input 10
   state needs-old needs-input 300
   state fresh new 5
-  run bash "$SCRIPT"
+  run /bin/bash "$SCRIPT"
   [ "$status" -eq 0 ]
   ids="$(grep -o '\[Zed [a-z-]*' <<<"$output" | cut -d' ' -f2)"
   [ "$ids" = "$(printf 'needs-ol\nneeds-ne\nidle-old\nbusy')" ]
@@ -70,29 +70,29 @@ state() {
 @test "-a also lists new and snoozed sessions" {
   state fresh new 5
   state sleepy idle 5 ".snoozed_until = $((NOW + 3600))"
-  run bash "$SCRIPT"
+  run /bin/bash "$SCRIPT"
   [ "$output" = "Nothing waiting for you." ]
-  run bash "$SCRIPT" -a
+  run /bin/bash "$SCRIPT" -a
   [[ "$output" == *fresh* ]]
   [[ "$output" == *sleepy* ]]
 }
 
 @test "--swiftbar shows working sessions in blue, without counting them" {
   state busy working 5
-  run bash "$SCRIPT" --swiftbar
+  run /bin/bash "$SCRIPT" --swiftbar
   [ "${lines[0]}" = "✓" ]
   [[ "$output" == *"🔵 "*"| bash="*"param1=open param2=busy"* ]]
 }
 
 @test "keeps empty fields in their columns" {
   state s1 idle 5 '.title = "" | .branch = ""'
-  run bash "$SCRIPT"
+  run /bin/bash "$SCRIPT"
   [[ "$output" == *"[Zed s1]"* ]]
 }
 
 @test "open focuses the Zed window for a Zed session, by row number" {
   state s1 needs-input 5
-  run bash "$SCRIPT" open 1
+  run /bin/bash "$SCRIPT" open 1
   [ "$status" -eq 0 ]
   grep -q "^osascript - $(basename "$REPO")$" "$MOCK_DIR/calls"
   # The zed CLI opens a new window rather than switching to the open one.
@@ -101,7 +101,7 @@ state() {
 
 @test "open says so when no Zed window has the folder open" {
   state s1 needs-input 5
-  OSASCRIPT_RESULT=no-window run bash "$SCRIPT" open s1
+  OSASCRIPT_RESULT=no-window run /bin/bash "$SCRIPT" open s1
   [ "$status" -eq 1 ]
   [[ "$output" == *"No Zed window is open on"* ]]
   grep -q "^terminal-notifier" "$MOCK_DIR/calls"
@@ -110,14 +110,14 @@ state() {
 @test "open explains the missing Accessibility permission" {
   state s1 needs-input 5
   OSASCRIPT_RESULT="execution error: osascript is not allowed assistive access. (-1728)" \
-    run bash "$SCRIPT" open s1
+    run /bin/bash "$SCRIPT" open s1
   [ "$status" -eq 1 ]
   [[ "$output" == *"Accessibility permission"* ]]
 }
 
 @test "open brings a terminal session's app forward and says which tab it's in" {
   state abc123 idle 5 '.entrypoint = "cli" | .term_program = "Tabby" | .app = "org.tabby" | .tty = "ttys008"'
-  run bash "$SCRIPT" open abc
+  run /bin/bash "$SCRIPT" open abc
   [ "$status" -eq 0 ]
   grep -q "^open -b org.tabby$" "$MOCK_DIR/calls"
   [[ "$output" == *"is in Tabby (ttys008). Switch to its tab."* ]]
@@ -128,7 +128,7 @@ state() {
 
 @test "open brings forward a terminal recorded without a bundle ID by name" {
   state abc123 idle 5 '.entrypoint = "cli" | .term_program = "ghostty"'
-  run bash "$SCRIPT" open abc
+  run /bin/bash "$SCRIPT" open abc
   grep -q "^open -a ghostty$" "$MOCK_DIR/calls"
 }
 
@@ -137,7 +137,7 @@ state() {
   # environment comes from whichever app started the tmux server.
   state abc123 idle 5 '.entrypoint = "cli" | .app = "dev.zed.Zed" | .tmux_pane = "%3"'
   export TMUX_PANES='%3\t4\n' TMUX_CLIENTS='4\t100\t/dev/ttys008\t555\n' PS_BUNDLE=org.tabby
-  run bash "$SCRIPT" open abc
+  run /bin/bash "$SCRIPT" open abc
   [ "$status" -eq 0 ]
   grep -q "^tmux switch-client -c /dev/ttys008 -t %3$" "$MOCK_DIR/calls"
   grep -q "^tmux select-pane -t %3$" "$MOCK_DIR/calls"
@@ -149,23 +149,23 @@ state() {
 @test "a tmux session uses the terminal most recently active on it" {
   state abc123 idle 5 '.entrypoint = "cli" | .tmux_pane = "%3"'
   export TMUX_PANES='%3\t4\n' TMUX_CLIENTS='4\t100\t/dev/ttys008\t555\n4\t200\t/dev/ttys013\t556\n'
-  run bash "$SCRIPT" open abc
+  run /bin/bash "$SCRIPT" open abc
   grep -q "^tmux switch-client -c /dev/ttys013 -t %3$" "$MOCK_DIR/calls"
 }
 
 @test "shows the app of the terminal showing a session's tmux session" {
   state abc123 idle 5 '.entrypoint = "cli" | .app = "dev.zed.Zed" | .tmux_pane = "%3"'
   export TMUX_PANES='%3\t4\n' TMUX_CLIENTS='4\t100\t/dev/ttys008\t555\n' PS_BUNDLE=org.tabby
-  run bash "$SCRIPT" --swiftbar
+  run /bin/bash "$SCRIPT" --swiftbar
   [[ "$output" == *"🐈⚪ "*'tooltip="Running in tmux session 4, in Tabby.'* ]]
 }
 
 @test "open says so when no terminal is showing a session's tmux session" {
   state abc123 idle 5 '.entrypoint = "cli" | .tmux_pane = "%3"'
   export TMUX_PANES='%3\t4\n'
-  run bash "$SCRIPT" --swiftbar
+  run /bin/bash "$SCRIPT" --swiftbar
   [[ "$output" == *"💻⚪ "*'tooltip="Running in tmux session 4, which no terminal is showing.'* ]]
-  run bash "$SCRIPT" open abc
+  run /bin/bash "$SCRIPT" open abc
   [ "$status" -eq 1 ]
   [[ "$output" == *"Run: tmux attach -t 4"* ]]
   ! grep -q "^tmux switch-client" "$MOCK_DIR/calls"
@@ -177,7 +177,7 @@ state() {
 EOF
   state tabby idle 5 '.entrypoint = "cli" | .app = "org.tabby"'
   state ghostty idle 5 '.entrypoint = "cli" | .app = "com.mitchellh.ghostty"'
-  run bash "$SCRIPT" --swiftbar
+  run /bin/bash "$SCRIPT" --swiftbar
   [[ "$output" == *"🐱⚪ "*'param2=tabby '*'Running in Tabby.'* ]]
   [[ "$output" == *"👻⚪ "*'param2=ghostty '*'Running in Ghostty.'* ]]
 }
@@ -185,7 +185,7 @@ EOF
 @test "an apps.json that isn't valid JSON is ignored, with a notification" {
   echo '{not json' > "$CQ_CONFIG_DIR/apps.json"
   state tabby idle 5 '.entrypoint = "cli" | .app = "org.tabby"'
-  run bash "$SCRIPT" --swiftbar
+  run /bin/bash "$SCRIPT" --swiftbar
   [ "$status" -eq 0 ]
   [[ "$output" == *"🐈⚪ "* ]]
   grep -q "^terminal-notifier.*Ignoring" "$MOCK_DIR/calls"
@@ -201,7 +201,7 @@ EOF
   chmod +x "$CQ_CONFIG_DIR/openers/my-opener"
   echo '{"org.tabby": {"open": "my-opener"}}' > "$CQ_CONFIG_DIR/apps.json"
   state abc123 idle 5 '.entrypoint = "cli" | .app = "org.tabby" | .tty = "ttys008"'
-  run bash "$SCRIPT" open abc
+  run /bin/bash "$SCRIPT" open abc
   [ "$status" -eq 0 ]
   grep -q "^CQ_SESSION_ID=abc123$" "$MOCK_DIR/opener_env"
   grep -q "^CQ_CWD=$REPO$" "$MOCK_DIR/opener_env"
@@ -217,7 +217,7 @@ EOF
   chmod +x "$CQ_CONFIG_DIR/openers/failing"
   echo '{"org.tabby": {"open": "failing"}}' > "$CQ_CONFIG_DIR/apps.json"
   state abc123 idle 5 '.entrypoint = "cli" | .app = "org.tabby"'
-  run bash "$SCRIPT" open abc
+  run /bin/bash "$SCRIPT" open abc
   [ "$status" -eq 3 ]
   [[ "$output" == *"Nope"* ]]
 }
@@ -225,7 +225,7 @@ EOF
 @test "open says so when an app's opener doesn't exist" {
   echo '{"org.tabby": {"open": "missing"}}' > "$CQ_CONFIG_DIR/apps.json"
   state abc123 idle 5 '.entrypoint = "cli" | .app = "org.tabby"'
-  run bash "$SCRIPT" open abc
+  run /bin/bash "$SCRIPT" open abc
   [ "$status" -eq 1 ]
   [[ "$output" == *"no cq opener called missing"* ]]
 }
@@ -235,39 +235,39 @@ EOF
   state tabby idle 5 '.entrypoint = "cli" | .app = "org.tabby"'
   state tabby-old idle 5 '.entrypoint = "cli" | .term_program = "Tabby"'
   state other idle 5 '.entrypoint = "cli" | .app = "com.mitchellh.ghostty" | .term_program = "ghostty"'
-  run bash "$SCRIPT" --swiftbar
+  run /bin/bash "$SCRIPT" --swiftbar
   [[ "$output" == *"⚡⚪ "*"param2=zed "* ]]
   [[ "$output" == *"🐈⚪ "*"param2=tabby "* ]]
   [[ "$output" == *"🐈⚪ "*"param2=tabby-old "* ]]
   [[ "$output" == *"💻⚪ "*"param2=other "*'tooltip="Running in ghostty.'* ]]
-  run bash "$SCRIPT"
+  run /bin/bash "$SCRIPT"
   [[ "$output" == *"[Tabby tabby]"* ]]
   [[ "$output" == *"[ghostty other]"* ]]
 }
 
 @test "open fails when the directory has gone" {
   state s1 idle 5 '.cwd = "/nonexistent/dir"'
-  run bash "$SCRIPT" open s1
+  run /bin/bash "$SCRIPT" open s1
   [ "$status" -eq 1 ]
 }
 
 @test "snooze hides a session" {
   state s1 idle 5
-  run bash "$SCRIPT" snooze s1 30m
+  run /bin/bash "$SCRIPT" snooze s1 30m
   [ "$status" -eq 0 ]
-  run bash "$SCRIPT"
+  run /bin/bash "$SCRIPT"
   [ "$output" = "Nothing waiting for you." ]
 }
 
 @test "snooze rejects a duration it can't read" {
   state s1 idle 5
-  run bash "$SCRIPT" snooze s1 soon
+  run /bin/bash "$SCRIPT" snooze s1 soon
   [ "$status" -eq 1 ]
 }
 
 @test "dismiss removes the session" {
   state s1 idle 5
-  run bash "$SCRIPT" dismiss s1
+  run /bin/bash "$SCRIPT" dismiss s1
   [ "$status" -eq 0 ]
   [ ! -f "$CQ_DIR/s1.json" ]
 }
@@ -275,7 +275,7 @@ EOF
 @test "an ambiguous ID prefix fails" {
   state abc1 idle 5
   state abc2 idle 5
-  run bash "$SCRIPT" dismiss abc
+  run /bin/bash "$SCRIPT" dismiss abc
   [ "$status" -eq 1 ]
 }
 
@@ -284,7 +284,7 @@ EOF
   state gone idle 60 '.cwd = "/nonexistent/dir"'
   state stale idle $((4 * 86400))
   state stuck working $((2 * 86400))
-  run bash "$SCRIPT" prune
+  run /bin/bash "$SCRIPT" prune
   [ "$status" -eq 0 ]
   [ -f "$CQ_DIR/fresh.json" ]
   [ ! -f "$CQ_DIR/gone.json" ]
@@ -295,7 +295,7 @@ EOF
 @test "--swiftbar shows the counts and a menu entry per session" {
   state s1 needs-input 5 '.message = "Needs | permission"'
   state s2 idle 5
-  run bash "$SCRIPT" --swiftbar
+  run /bin/bash "$SCRIPT" --swiftbar
   [ "$status" -eq 0 ]
   [ "${lines[0]}" = "🟠 1 ⚪ 1" ]
   [[ "$output" == *"🟠 "*" · title s1 | bash="*"param1=open param2=s1"*'tooltip="Needs  permission. Running in Zed. Option-click to dismiss"'* ]]
@@ -307,7 +307,7 @@ EOF
 @test "--swiftbar gives session lines an action, not a submenu" {
   # SwiftBar drops the submenu of an item whose text changes between runs.
   state s1 idle 5
-  run bash "$SCRIPT" --swiftbar
+  run /bin/bash "$SCRIPT" --swiftbar
   session_line="$(grep -n '⚪ .*param1=open' <<<"$output" | cut -d: -f1)"
   [ -n "$session_line" ]
   next="$(sed -n "$((session_line + 1))p" <<<"$output")"
@@ -315,7 +315,7 @@ EOF
 }
 
 @test "--swiftbar shows a tick when nothing is waiting" {
-  run bash "$SCRIPT" --swiftbar
+  run /bin/bash "$SCRIPT" --swiftbar
   [ "${lines[0]}" = "✓" ]
 }
 
@@ -327,7 +327,7 @@ EOF
   state dead idle 5 ".pid = $pid | .pid_started = \"$started\""
   kill "$pid"
   wait "$pid" 2>/dev/null || true
-  run bash "$SCRIPT"
+  run /bin/bash "$SCRIPT"
   [ "$status" -eq 0 ]
   [ -f "$CQ_DIR/alive.json" ]
   [ ! -f "$CQ_DIR/dead.json" ]
@@ -335,19 +335,19 @@ EOF
 
 @test "drops a session whose PID now belongs to a different process" {
   state reused idle 5 ".pid = $$ | .pid_started = \"Thu Jan  1 00:00:00 1970\""
-  run bash "$SCRIPT"
+  run /bin/bash "$SCRIPT"
   [ ! -f "$CQ_DIR/reused.json" ]
 }
 
 @test "keeps sessions with no recorded process" {
   state old idle 5
-  run bash "$SCRIPT"
+  run /bin/bash "$SCRIPT"
   [ -f "$CQ_DIR/old.json" ]
 }
 
 @test "--swiftbar shortens long titles itself" {
   state s1 idle 5 ".title = \"$(printf 'x%.0s' {1..120})\""
-  run bash "$SCRIPT" --swiftbar
+  run /bin/bash "$SCRIPT" --swiftbar
   line="$(grep 'param1=open' <<<"$output")"
   [[ "$line" == *"… | bash="* ]]
   [[ "$line" != *"$(printf 'x%.0s' {1..80})"* ]]
@@ -355,6 +355,6 @@ EOF
 
 @test "prune removes sessions that were never prompted after a day" {
   state unprompted new $((2 * 86400))
-  run bash "$SCRIPT" prune
+  run /bin/bash "$SCRIPT" prune
   [ ! -f "$CQ_DIR/unprompted.json" ]
 }

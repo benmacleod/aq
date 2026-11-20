@@ -171,9 +171,9 @@ state() {
   ! grep -q "^tmux switch-client" "$MOCK_DIR/calls"
 }
 
-@test "apps.json overrides and adds apps" {
-  cat > "$CQ_CONFIG_DIR/apps.json" << 'EOF'
-{"org.tabby": {"emoji": "🐱"}, "com.mitchellh.ghostty": {"name": "Ghostty", "emoji": "👻"}}
+@test "config.json overrides and adds apps" {
+  cat > "$CQ_CONFIG_DIR/config.json" << 'EOF'
+{"apps": {"org.tabby": {"emoji": "🐱"}, "com.mitchellh.ghostty": {"name": "Ghostty", "emoji": "👻"}}}
 EOF
   state tabby idle 5 '.entrypoint = "cli" | .app = "org.tabby"'
   state ghostty idle 5 '.entrypoint = "cli" | .app = "com.mitchellh.ghostty"'
@@ -182,13 +182,32 @@ EOF
   [[ "$output" == *"👻⚪ "*'param2=ghostty '*'Running in Ghostty.'* ]]
 }
 
-@test "an apps.json that isn't valid JSON is ignored, with a notification" {
-  echo '{not json' > "$CQ_CONFIG_DIR/apps.json"
+@test "a config.json that isn't valid JSON is ignored, with a notification" {
+  echo '{not json' > "$CQ_CONFIG_DIR/config.json"
   state tabby idle 5 '.entrypoint = "cli" | .app = "org.tabby"'
   run /bin/bash "$SCRIPT" --swiftbar
   [ "$status" -eq 0 ]
   [[ "$output" == *"🐈⚪ "* ]]
   grep -q "^terminal-notifier.*Ignoring" "$MOCK_DIR/calls"
+}
+
+@test "shows the emoji config.json gives the session's repo" {
+  echo '{"repos": {"tc": "📰"}}' > "$CQ_CONFIG_DIR/config.json"
+  state news idle 5 '.repo = "tc"'
+  state other idle 5 '.repo = "other"'
+  run /bin/bash "$SCRIPT" --swiftbar
+  [[ "$output" == *"📰⚡⚪ "*"param2=news "* ]]
+  [[ "$output" == *$'\n⚡⚪ '*"param2=other "* ]]
+  run /bin/bash "$SCRIPT"
+  [[ "$output" == *"📰 $(basename "$REPO")"* ]]
+}
+
+@test "shows only the last part of the session's directory" {
+  mkdir -p "$REPO/worktrees/tc-123"
+  state s1 idle 5 ".cwd = \"$REPO/worktrees/tc-123\""
+  run /bin/bash "$SCRIPT" --swiftbar
+  [[ "$output" == *"⚪ tc-123 · "* ]]
+  [[ "$output" != *"worktrees/"* ]]
 }
 
 @test "open runs your own opener for an app, with the session's details" {
@@ -199,7 +218,7 @@ env | grep '^CQ_' | sort > "$MOCK_DIR/opener_env"
 echo "Opened it"
 EOF
   chmod +x "$CQ_CONFIG_DIR/openers/my-opener"
-  echo '{"org.tabby": {"open": "my-opener"}}' > "$CQ_CONFIG_DIR/apps.json"
+  echo '{"apps": {"org.tabby": {"open": "my-opener"}}}' > "$CQ_CONFIG_DIR/config.json"
   state abc123 idle 5 '.entrypoint = "cli" | .app = "org.tabby" | .tty = "ttys008"'
   run /bin/bash "$SCRIPT" open abc
   [ "$status" -eq 0 ]
@@ -215,7 +234,7 @@ EOF
   mkdir -p "$CQ_CONFIG_DIR/openers"
   printf '#!/usr/bin/env bash\necho "Nope"\nexit 3\n' > "$CQ_CONFIG_DIR/openers/failing"
   chmod +x "$CQ_CONFIG_DIR/openers/failing"
-  echo '{"org.tabby": {"open": "failing"}}' > "$CQ_CONFIG_DIR/apps.json"
+  echo '{"apps": {"org.tabby": {"open": "failing"}}}' > "$CQ_CONFIG_DIR/config.json"
   state abc123 idle 5 '.entrypoint = "cli" | .app = "org.tabby"'
   run /bin/bash "$SCRIPT" open abc
   [ "$status" -eq 3 ]
@@ -223,7 +242,7 @@ EOF
 }
 
 @test "open says so when an app's opener doesn't exist" {
-  echo '{"org.tabby": {"open": "missing"}}' > "$CQ_CONFIG_DIR/apps.json"
+  echo '{"apps": {"org.tabby": {"open": "missing"}}}' > "$CQ_CONFIG_DIR/config.json"
   state abc123 idle 5 '.entrypoint = "cli" | .app = "org.tabby"'
   run /bin/bash "$SCRIPT" open abc
   [ "$status" -eq 1 ]

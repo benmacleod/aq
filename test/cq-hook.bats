@@ -189,13 +189,59 @@ field() {
   [ -n "$(field pid_started)" ]
 }
 
-@test "records the app Claude runs in, and keeps it when an event has none" {
-  printf '{"hook_event_name":"SessionStart","session_id":"s1"}' \
-    | __CFBundleIdentifier=org.tabby TERM_PROGRAM=Tabby /bin/bash "$HOOK"
+@test "records the app Claude runs in" {
+  run_under "$(fake_app Tabby org.tabby)" '{"hook_event_name":"SessionStart","session_id":"s1"}' \
+    __CFBundleIdentifier=org.tabby TERM_PROGRAM=Tabby
   [ "$(field app)" = "org.tabby" ]
   [ "$(field term_program)" = "Tabby" ]
-  printf '{"hook_event_name":"Stop","session_id":"s1"}' \
-    | env -u __CFBundleIdentifier -u TERM_PROGRAM /bin/bash "$HOOK"
-  [ "$(field app)" = "org.tabby" ]
-  [ "$(field term_program)" = "Tabby" ]
+}
+
+# run_under <argv0> <hook input> [env...]: runs the hook under a process
+# called fake-claude, under a process called <argv0>. Each runs the next as
+# a child, so neither is replaced by it.
+run_under() {
+  local argv0="$1" input="$2"
+  shift 2
+  cat > "$MOCK_DIR/under" << 'SCRIPT'
+#!/bin/bash
+(exec -a fake-claude /bin/bash -c '/bin/bash "$0"; :' "$1")
+SCRIPT
+  printf '%s' "$input" | env "$@" bash -c '(exec -a "$0" /bin/bash "$1" "$2")' \
+    "$argv0" "$MOCK_DIR/under" "$HOOK"
+}
+
+# fake_app <name> <bundle ID>: makes an app bundle, and prints the path of
+# its executable.
+fake_app() {
+  local app="$MOCK_DIR/$1.app"
+  mkdir -p "$app/Contents/MacOS"
+  plutil -create xml1 "$app/Contents/Info.plist"
+  plutil -insert CFBundleIdentifier -string "$2" "$app/Contents/Info.plist"
+  echo "$app/Contents/MacOS/$1"
+}
+
+@test "a Zed started from a terminal in tmux records Zed, not the terminal or tmux" {
+  run_under "$(fake_app Zed dev.zed.Zed)" '{"hook_event_name":"Stop","session_id":"s1"}' \
+    __CFBundleIdentifier=org.tabby TERM_PROGRAM=tmux TMUX_PANE=%16
+  [ "$(field app)" = "dev.zed.Zed" ]
+  [ "$(field tmux_pane)" = "null" ]
+  [ "$(field term_program)" = "null" ]
+}
+
+@test "records the tmux pane of a Claude running in tmux" {
+  run_under tmux '{"hook_event_name":"Stop","session_id":"s1"}' TMUX_PANE=%16 TERM_PROGRAM=tmux
+  [ "$(field tmux_pane)" = "%16" ]
+}
+
+@test "records the repo, the same for every worktree" {
+  git -C "$REPO" init -q
+  git -C "$REPO" remote add origin git@github.com:someone/my-repo.git
+  git -C "$REPO" commit -q --allow-empty -m init
+  git -C "$REPO" worktree add -q "$REPO-wt"
+  printf '{"hook_event_name":"SessionStart","session_id":"s1","cwd":"%s"}' "$REPO-wt" | /bin/bash "$HOOK"
+  [ "$(field repo)" = "my-repo" ]
+  git -C "$REPO" remote remove origin
+  printf '{"hook_event_name":"Stop","session_id":"s1","cwd":"%s"}' "$REPO-wt" | /bin/bash "$HOOK"
+  [ "$(field repo)" = "$(basename "$REPO")" ]
+  rm -rf "$REPO-wt"
 }

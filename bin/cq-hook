@@ -30,6 +30,43 @@ claude_pid() {
   done
 }
 
+# process_host <pid>: prints what the process runs under: "tmux" if it is
+# in a tmux pane, or else the bundle ID of the app that started it (e.g.
+# dev.zed.Zed), or nothing if neither turns up among its ancestors.
+#
+# The environment can't tell you this. A Zed started from a terminal passes
+# that terminal's __CFBundleIdentifier, TERM_PROGRAM and TMUX_PANE on to every
+# agent it runs.
+process_host() {
+  local pid="$1" command
+  while [ -n "$pid" ] && [ "$pid" -gt 1 ]; do
+    command="$(ps -o comm= -p "$pid")"
+    case "$command" in
+      tmux | tmux:* | */tmux) echo tmux; return 0 ;;
+      # The outermost app, not e.g. Tabby Helper.app inside Tabby.app.
+      /*.app/*)
+        plutil -extract CFBundleIdentifier raw "${command%%.app/*}.app/Contents/Info.plist" 2>/dev/null
+        return 0 ;;
+    esac
+    pid="$(ps -o ppid= -p "$pid" | tr -d ' ')"
+  done
+}
+
+# Prints the name of the repo the directory is in: the last part of its
+# origin URL (e.g. tc), or else the folder of its main checkout, so that
+# every worktree of a repo gets the same name.
+repo_name() {
+  local url common
+  url="$(git -C "$1" remote get-url origin 2>/dev/null)"
+  if [ -n "$url" ]; then
+    url="${url%/}"
+    url="${url%.git}"
+    echo "${url##*[/:]}"
+  elif common="$(git -C "$1" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"; then
+    basename "$(dirname "$common")"
+  fi
+}
+
 short_title() {
   tr '\n\t' '  ' | sed -e 's/  */ /g' -e 's/^ //' -e 's/ $//' | cut -c1-70
 }
@@ -87,23 +124,32 @@ main() {
   # The Claude process, so cq can drop the session once it has gone (Zed
   # doesn't always send SessionEnd when you close a thread), and its
   # terminal, so cq can tell you which tab it's in.
-  local tty=""
+  local tty="" host="" app="${__CFBundleIdentifier:-}" term_program="${TERM_PROGRAM:-}"
+  local tmux_pane="${TMUX_PANE:-}"
   pid="$(claude_pid)"
   if [ -n "$pid" ]; then
     pid_started="$(cq_process_started "$pid")"
     tty="$(ps -o tty= -p "$pid" | tr -d ' ')"
     [ "$tty" = "??" ] && tty=""
+    host="$(process_host "$pid")"
+  fi
+  # Outside tmux, any TMUX_PANE was passed down from elsewhere, and so was
+  # TERM_PROGRAM if the app differs. "none" clears the recorded value.
+  if [ -n "$host" ] && [ "$host" != "tmux" ]; then
+    tmux_pane="none"
+    [ "$host" = "$app" ] || term_program="none"
+    app="$host"
   fi
 
   # update <jq filter> [jq args...]: applies the filter after refreshing the
   # fields every event sets. Fields with no value this time keep their old
-  # one.
+  # one, and "none" clears it.
   #
   # app is the bundle ID of the app Claude runs in (e.g. dev.zed.Zed,
-  # org.tabby), which macOS passes to every process the app starts.
+  # org.tabby): see process_host.
   update() {
     cq_merge_state "$id" "
-      def keep(\$new): if \$new == \"\" then . else \$new end;
+      def keep(\$new): if \$new == \"\" then . elif \$new == \"none\" then null else \$new end;
       .session_id = \$id
       | .cwd |= keep(\$cwd)
       | .transcript_path |= keep(\$transcript)
@@ -116,10 +162,10 @@ main() {
       | if \$pid == \"\" then . else .pid = (\$pid | tonumber) | .pid_started = \$pid_started end
       | $1" \
       --arg id "$id" --arg cwd "$cwd" --arg transcript "$transcript" --argjson now "$now" \
-      --arg app "${__CFBundleIdentifier:-}" \
+      --arg app "$app" \
       --arg entrypoint "${CLAUDE_CODE_ENTRYPOINT:-}" \
-      --arg term_program "${TERM_PROGRAM:-}" \
-      --arg tmux_pane "${TMUX_PANE:-}" \
+      --arg term_program "$term_program" \
+      --arg tmux_pane "$tmux_pane" \
       --arg tty "$tty" \
       --arg pid "$pid" --arg pid_started "$pid_started" "${@:2}"
   }
@@ -132,14 +178,19 @@ main() {
     git -C "$cwd" branch --show-current 2>/dev/null || true
   }
 
+  # The branch can change during a session, and the repo too if you cd.
+  # Recorded when a session starts and at the end of each turn.
+  git_fields() {
+    update ".branch = (if \$branch == \"\" then .branch else \$branch end)
+      | .repo = (if \$repo == \"\" then .repo else \$repo end)
+      | $1" --arg branch "$(branch)" --arg repo "$(repo_name "$cwd")" "${@:2}"
+  }
+
   case "$event" in
     SessionStart)
       # "new" until the first prompt: Zed starts a session for a thread
       # whether or not you ever type into it. cq hides these.
-      update '.status = (.status // "new")
-        | .updated_at = (.updated_at // $now)
-        | .branch = $branch' \
-        --arg branch "$(branch)"
+      git_fields '.status = (.status // "new") | .updated_at = (.updated_at // $now)'
       ;;
 
     UserPromptSubmit)
@@ -195,12 +246,11 @@ main() {
       local title=""
       [ -n "$(jq -r '.title // empty' "$(cq_state_file "$id")" 2>/dev/null)" ] \
         || title="$(title_from_transcript "$transcript" | short_title)"
-      update '.status = "idle"
+      git_fields '.status = "idle"
         | .updated_at = $now
         | .message = null
-        | .branch = (if $branch == "" then .branch else $branch end)
         | .title = (if (.title // "") == "" then $title else .title end)' \
-        --arg branch "$(branch)" --arg title "$title"
+        --arg title "$title"
       ;;
 
     SessionEnd)

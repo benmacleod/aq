@@ -43,19 +43,27 @@ notify() {
   terminal-notifier -title cq -message "$1" -group cq >/dev/null 2>&1 || true
 }
 
-# The apps cq knows, by bundle ID: the name and emoji to show, and the
+# cq's settings. $CQ_CONFIG_DIR/config.json, in the same shape, is merged
+# over these.
+#
+# apps: the apps cq knows, by bundle ID: the name and emoji to show, and the
 # opener that switches to a session (see run_opener). Other apps get 💻,
 # their TERM_PROGRAM as a name, and the "activate" opener.
-# $CQ_CONFIG_DIR/apps.json, in the same shape, is merged over this.
-APPS='{
-  "dev.zed.Zed": {"name": "Zed", "emoji": "⚡", "open": "zed-window"},
-  "org.tabby": {"name": "Tabby", "emoji": "🐈"}
+#
+# repos: an emoji to show for each repo, by name (see repo_name in cq-hook),
+# e.g. {"tc": "📰"}.
+CONFIG='{
+  "apps": {
+    "dev.zed.Zed": {"name": "Zed", "emoji": "⚡", "open": "zed-window"},
+    "org.tabby": {"name": "Tabby", "emoji": "🐈"}
+  },
+  "repos": {}
 }'
-if [ -f "$CQ_CONFIG_DIR/apps.json" ]; then
-  if merged="$(jq -s '.[0] * .[1]' <(echo "$APPS") "$CQ_CONFIG_DIR/apps.json" 2>/dev/null)"; then
-    APPS="$merged"
+if [ -f "$CQ_CONFIG_DIR/config.json" ]; then
+  if merged="$(jq -s '.[0] * .[1]' <(echo "$CONFIG") "$CQ_CONFIG_DIR/config.json" 2>/dev/null)"; then
+    CONFIG="$merged"
   else
-    notify "Ignoring $CQ_CONFIG_DIR/apps.json, which isn't valid JSON."
+    notify "Ignoring $CQ_CONFIG_DIR/config.json, which isn't valid JSON."
   fi
 fi
 
@@ -95,7 +103,7 @@ TMUX_JSON="$(tmux_json)"
 
 # jq with the definitions the commands share.
 cq_jq() {
-  jq --argjson now "$NOW" --arg home "$HOME" --argjson apps "$APPS" --argjson tmux "$TMUX_JSON" "$@"
+  jq --argjson now "$NOW" --arg home "$HOME" --argjson config "$CONFIG" --argjson tmux "$TMUX_JSON" "$@"
 }
 
 JQ_DEFS='
@@ -104,7 +112,8 @@ JQ_DEFS='
       elif $s < 3600 then "\($s / 60 | floor)m"
       elif $s < 86400 then "\($s / 3600 | floor)h"
       else "\($s / 86400 | floor)d" end;
-  def place: (.cwd // "?") | sub("^" + $home + "/Code/"; "") | sub("^" + $home; "~");
+  def place: (.cwd // "?") | if . == $home then "~" else split("/") | last end;
+  def repo_emoji: $config.repos[.repo // ""] // "";
   def title: .title // "" | select(. != "");
   # Where the session is showing in tmux, if it runs in tmux: see tmux_json.
   def tmux: $tmux[.tmux_pane // ""];
@@ -115,6 +124,7 @@ JQ_DEFS='
   def app:
     (if tmux then (tmux.app // "") else (.app // "") end) as $id
     | (if tmux then "" else (.term_program // "") end) as $term
+    | $config.apps as $apps
     | ([$apps[] | select(.name == $term)] | first) as $by_name
     | if $apps[$id] then $apps[$id]
       elif tmux and $id == "" then {name: "tmux", emoji: "💻"}
@@ -202,7 +212,7 @@ cmd_list() {
   [ "${1:-}" = "-a" ] && all=true
   rows="$(states_json "$all" | cq_jq -r "$JQ_DEFS
     to_entries[]
-    | [(.key + 1), .value.status, (.value.updated_at | age), (.value | place),
+    | [(.key + 1), .value.status, (.value.updated_at | age), (.value | (repo_emoji | if . == \"\" then \"\" else . + \" \" end) + place),
        (.value.branch // \"\"), (.value | app | .name), (.value | title // \"\"),
        (.value.message // \"\"), .value.session_id[0:8]]
     | map(tostring | gsub(\"[\\u001f\\n]\"; \" \")) | join(\"\\u001f\")")"
@@ -347,7 +357,7 @@ cmd_swiftbar() {
       \"---\",
       (.[]
         | ({\"needs-input\": \"🟠\", \"working\": \"🔵\"}[.status] // \"⚪\") as \$icon
-        | \"\(app | .emoji)\(\$icon) \([place, (.updated_at | age), title] | join(\" · \") | clean | trunc(80))\"
+        | \"\(repo_emoji)\(app | .emoji)\(\$icon) \([place, (.updated_at | age), title] | join(\" · \") | clean | trunc(80))\"
             + run(\"open\"; .session_id) + \" tooltip=\\\"\(tooltip)\\\"\",
           \"✕ Dismiss: \([place, title] | join(\" · \") | clean | trunc(70))\"
             + run(\"dismiss\"; .session_id) + \" alternate=true\"),

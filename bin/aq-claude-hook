@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+#
+# aq's adapter for Claude Code. Reads a hook's JSON from stdin and records
+# the session's state with aq-record.
+#
+# Hook it up in ~/.claude/settings.json for SessionStart, UserPromptSubmit,
+# Notification, Stop, SessionEnd, PreToolUse (AskUserQuestion|ExitPlanMode)
+# and PostToolUse. See the README.
+#
+# It always exits 0 and prints nothing: a hook's stdout can end up in
+# Claude's context, and a failing hook mustn't get in Claude's way. Errors go
+# to $AQ_STATE_DIR/hook-errors.log.
+
+set -uo pipefail
+
+DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+source "$DIR/../lib/aq.sh"
+
+title_from_transcript() {
+  [ -f "$1" ] || return 0
+  grep -m1 '"type":"user"' "$1" \
+    | jq -r '.message.content
+             | if type == "string" then . else (map(select(.type == "text").text) | first // "") end' \
+    2>/dev/null
+}
+
+# A plainer message for the tools that wait for you. Some clients (e.g. Zed)
+# also ask permission for them, with a message naming the tool.
+waiting_message() {
+  case "$1" in
+    AskUserQuestion) echo "Asking you a question" ;;
+    ExitPlanMode) echo "Waiting for plan approval" ;;
+  esac
+}
+
+main() {
+  local input id
+  input="$(cat)"
+  id="$(jq -r '.session_id // empty' <<<"$input")"
+  [ -n "$id" ] || return 0
+
+  record() {
+    "$DIR/aq-record" --agent claude --session "$id" \
+      --cwd "$(jq -r '.cwd // empty' <<<"$input")" \
+      --transcript "$(jq -r '.transcript_path // empty' <<<"$input")" "$@"
+  }
+
+  case "$(jq -r '.hook_event_name // empty' <<<"$input")" in
+    SessionStart) record start ;;
+    UserPromptSubmit) record prompt "$(jq -r '.prompt // empty' <<<"$input")" ;;
+
+    Notification)
+      # idle_prompt fires after Claude has sat idle for a minute. Stop already
+      # marked the session idle, so it adds nothing.
+      [ "$(jq -r '.notification_type // empty' <<<"$input")" = "idle_prompt" ] && return 0
+      local message plain
+      message="$(jq -r '.message // empty' <<<"$input")"
+      # e.g. "Claude needs your permission to use AskUserQuestion"
+      plain="$(waiting_message "${message##* }")"
+      record needs-input "${plain:-$message}"
+      ;;
+
+    PreToolUse)
+      local message
+      message="$(waiting_message "$(jq -r '.tool_name // empty' <<<"$input")")"
+      [ -n "$message" ] && record needs-input "$message"
+      ;;
+
+    PostToolUse) record answered ;;
+
+    Stop)
+      # The title for a session that has none, e.g. because it started before
+      # these hooks were set up.
+      local title=""
+      [ -n "$(jq -r '.title // empty' "$(aq_state_file "$id")" 2>/dev/null)" ] \
+        || title="$(title_from_transcript "$(jq -r '.transcript_path // empty' <<<"$input")")"
+      record idle "$title"
+      ;;
+
+    SessionEnd) record end ;;
+  esac
+}
+
+# Set for the Claude that aq-record runs to summarize titles, so its own
+# session isn't recorded.
+[ "${AQ_HOOK_DISABLED:-}" = "1" ] && exit 0
+
+mkdir -p "$AQ_STATE_DIR" 2>/dev/null
+main >/dev/null 2>>"$AQ_STATE_DIR/hook-errors.log"
+exit 0

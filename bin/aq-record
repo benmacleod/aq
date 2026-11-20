@@ -1,0 +1,263 @@
+#!/usr/bin/env bash
+#
+# Records the state of an agent session for aq. Each agent has an adapter
+# (e.g. aq-claude-hook) that turns the agent's own hook events into calls to
+# this.
+#
+# Usage: aq-record --agent <name> --session <id> [options] <event> [text]
+#
+# Events:
+#   start                 The session started. It stays hidden ("new") until
+#                         its first prompt: some apps start a session for a
+#                         thread whether or not you ever type into it.
+#   prompt <text>         You sent a prompt. The session is working, and
+#                         titled with the prompt, which Claude summarizes if
+#                         it is long.
+#   needs-input <message> The agent is waiting for you, e.g. for permission.
+#   answered              A tool ran, so whatever the agent asked has been
+#                         answered. Only changes a session that needs input.
+#   idle [title]          The agent finished its turn. The title is used if
+#                         the session has none.
+#   end                   The session ended. Removes it.
+#
+# Options:
+#   --cwd <dir>           The session's directory.
+#   --transcript <path>   The agent's transcript of the session.
+#   --pid <pid>           The agent's process. By default, the nearest
+#                         ancestor whose program has the agent's name.
+#
+# Set AQ_SUMMARIZE=0 to turn off summarized titles.
+
+set -uo pipefail
+
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/aq.sh"
+
+# usage [status]: prints the comment at the top of this file.
+usage() {
+  sed -n '3,/^$/s/^# \{0,1\}//p' "$0" >&2
+  exit "${1:-1}"
+}
+
+# agent_pid <name>: prints the PID of the nearest ancestor whose program is
+# called <name>, or <name>-something (e.g. codex-acp). Agents may start hooks
+# through a shell, and an adapter runs this, so $PPID alone isn't enough.
+#
+# It goes by the program's name, not its whole command, which for the shell
+# running an adapter can mention the agent too (e.g. aq-claude-hook).
+agent_pid() {
+  local pid="$PPID" _ program
+  for _ in 1 2 3 4 5 6 7 8; do
+    [ -n "$pid" ] && [ "$pid" -gt 1 ] || return 0
+    program="$(ps -o comm= -p "$pid")"
+    case "${program##*/}" in
+      "$1" | "$1"-*) echo "$pid"; return 0 ;;
+    esac
+    pid="$(ps -o ppid= -p "$pid" | tr -d ' ')"
+  done
+}
+
+# process_host <pid>: prints what the process runs under: "tmux" if it is
+# in a tmux pane, or else the bundle ID of the app that started it (e.g.
+# dev.zed.Zed), or nothing if neither turns up among its ancestors.
+#
+# The environment can't tell you this. A Zed started from a terminal passes
+# that terminal's __CFBundleIdentifier, TERM_PROGRAM and TMUX_PANE on to every
+# agent it runs.
+process_host() {
+  local pid="$1" command
+  while [ -n "$pid" ] && [ "$pid" -gt 1 ]; do
+    command="$(ps -o comm= -p "$pid")"
+    case "$command" in
+      tmux | tmux:* | */tmux) echo tmux; return 0 ;;
+      # The outermost app, not e.g. Tabby Helper.app inside Tabby.app.
+      /*.app/*)
+        plutil -extract CFBundleIdentifier raw "${command%%.app/*}.app/Contents/Info.plist" 2>/dev/null
+        return 0 ;;
+    esac
+    pid="$(ps -o ppid= -p "$pid" | tr -d ' ')"
+  done
+}
+
+# Prints the name of the repo the directory is in: the last part of its
+# origin URL (e.g. tc), or else the folder of its main checkout, so that
+# every worktree of a repo gets the same name.
+repo_name() {
+  local url common
+  url="$(git -C "$1" remote get-url origin 2>/dev/null)"
+  if [ -n "$url" ]; then
+    url="${url%/}"
+    url="${url%.git}"
+    echo "${url##*[/:]}"
+  elif common="$(git -C "$1" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"; then
+    basename "$(dirname "$common")"
+  fi
+}
+
+short_title() {
+  tr '\n\t' '  ' | sed -e 's/  */ /g' -e 's/^ //' -e 's/ $//' | cut -c1-70
+}
+
+# Asks Claude for a short title for a prompt, and stores it, unless a newer
+# prompt has arrived since. Run it in the background: it takes a few
+# seconds.
+#
+# The child Claude gets no tools, MCP servers or settings, so it can only
+# reply, not try to carry out the prompt, and doesn't run your hooks.
+# --no-session-persistence keeps it out of `claude --resume`, and
+# AQ_HOOK_DISABLED is a backstop against aq recording it.
+summarize_title() {
+  local id="$1" token="$2" prompt="$3" summary
+  summary="$(
+    printf '%s' "$prompt" | head -c 2000 \
+      | AQ_HOOK_DISABLED=1 claude -p --model haiku --no-session-persistence \
+          --tools "" --strict-mcp-config --setting-sources "" \
+          --system-prompt "You write short titles for requests sent to a coding agent. You never carry out the request. Reply with a title of at most 6 words and nothing else: no quotes, no full stop." \
+          "Title this request." 2>/dev/null \
+      | head -n1 | sed -e 's/^["'\'' ]*//' -e 's/["'\''. ]*$//' | short_title
+  )"
+  [ -n "$summary" ] || return 0
+  aq_merge_state "$id" 'if .title_token == $token then .title = $summary else . end' \
+    --arg token "$token" --arg summary "$summary"
+}
+
+main() {
+  local agent="" id="" cwd="" transcript="" pid=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --agent) agent="${2:-}"; shift 2 ;;
+      --session) id="${2:-}"; shift 2 ;;
+      --cwd) cwd="${2:-}"; shift 2 ;;
+      --transcript) transcript="${2:-}"; shift 2 ;;
+      --pid) pid="${2:-}"; shift 2 ;;
+      -h|--help) usage 0 ;;
+      --*) echo "aq-record: unknown option $1" >&2; usage ;;
+      *) break ;;
+    esac
+  done
+  local event="${1:-}" text="${2:-}"
+  [ -n "$agent" ] && [ -n "$id" ] && [ -n "$event" ] || usage
+
+  local now
+  now="$(aq_now)"
+
+  if [ "$event" = "end" ]; then
+    rm -f "$(aq_state_file "$id")"
+    return 0
+  fi
+
+  # The agent's process, so aq can drop the session once it has gone (Zed
+  # doesn't always end sessions when you close a thread), and its terminal,
+  # so aq can tell you which tab it's in.
+  local pid_started="" tty="" host="" app="${__CFBundleIdentifier:-}"
+  local term_program="${TERM_PROGRAM:-}" tmux_pane="${TMUX_PANE:-}"
+  [ -n "$pid" ] || pid="$(agent_pid "$agent")"
+  if [ -n "$pid" ]; then
+    pid_started="$(aq_process_started "$pid")"
+    tty="$(ps -o tty= -p "$pid" | tr -d ' ')"
+    [ "$tty" = "??" ] && tty=""
+    host="$(process_host "$pid")"
+  fi
+  # Outside tmux, any TMUX_PANE was passed down from elsewhere, and so was
+  # TERM_PROGRAM if the app differs. "none" clears the recorded value.
+  if [ -n "$host" ] && [ "$host" != "tmux" ]; then
+    tmux_pane="none"
+    [ "$host" = "$app" ] || term_program="none"
+    app="$host"
+  fi
+
+  # update <jq filter> [jq args...]: applies the filter after refreshing the
+  # fields every event sets. Fields with no value this time keep their old
+  # one, and "none" clears it.
+  update() {
+    aq_merge_state "$id" "
+      def keep(\$new): if \$new == \"\" then . elif \$new == \"none\" then null else \$new end;
+      .session_id = \$id
+      | .agent = \$agent
+      | .cwd |= keep(\$cwd)
+      | .transcript_path |= keep(\$transcript)
+      | .app |= keep(\$app)
+      | .term_program |= keep(\$term_program)
+      | .tmux_pane |= keep(\$tmux_pane)
+      | .tty |= keep(\$tty)
+      | .started_at = (.started_at // \$now)
+      | if \$pid == \"\" then . else .pid = (\$pid | tonumber) | .pid_started = \$pid_started end
+      | $1" \
+      --arg id "$id" --arg agent "$agent" --arg cwd "$cwd" --arg transcript "$transcript" \
+      --argjson now "$now" --arg app "$app" --arg term_program "$term_program" \
+      --arg tmux_pane "$tmux_pane" --arg tty "$tty" \
+      --arg pid "$pid" --arg pid_started "$pid_started" "${@:2}"
+  }
+
+  # The branch can change during a session, and the repo too if the agent
+  # changes directory. Recorded when a session starts and at the end of each
+  # turn.
+  git_fields() {
+    local dir="${cwd:-$(jq -r '.cwd // empty' "$(aq_state_file "$id")" 2>/dev/null)}"
+    local branch="" repo=""
+    if [ -n "$dir" ]; then
+      branch="$(git -C "$dir" branch --show-current 2>/dev/null || true)"
+      repo="$(repo_name "$dir")"
+    fi
+    update ".branch = (if \$branch == \"\" then .branch else \$branch end)
+      | .repo = (if \$repo == \"\" then .repo else \$repo end)
+      | $1" --arg branch "$branch" --arg repo "$repo" "${@:2}"
+  }
+
+  case "$event" in
+    start)
+      git_fields '.status = (.status // "new") | .updated_at = (.updated_at // $now)'
+      ;;
+
+    prompt)
+      # Replying is the only thing that clears the flag: switching to the
+      # window and away again leaves it set. The title is the latest prompt,
+      # shortened; long prompts then get a summary from Claude in the
+      # background. The token stops a slow summary from replacing a newer
+      # prompt's title.
+      local token="$now-$RANDOM"
+      update '.status = "working"
+        | .updated_at = $now
+        | .message = null
+        | .snoozed_until = null
+        | .title = (if $title == "" then .title else $title end)
+        | .title_token = $token' \
+        --arg title "$(printf '%s' "$text" | short_title)" --arg token "$token"
+      if [ "${AQ_SUMMARIZE:-1}" != "0" ] && [ "${#text}" -gt 50 ] && command -v claude >/dev/null; then
+        summarize_title "$id" "$token" "$text" </dev/null >/dev/null 2>>"$AQ_STATE_DIR/hook-errors.log" &
+        disown
+      fi
+      ;;
+
+    needs-input)
+      update '.status = "needs-input" | .updated_at = $now | .message = $message' --arg message "$text"
+      ;;
+
+    answered)
+      # Tools run all the time, so only write on a change.
+      local file
+      file="$(aq_state_file "$id")"
+      [ -f "$file" ] && [ "$(jq -r '.status' "$file")" = "needs-input" ] || return 0
+      update '.status = "working" | .updated_at = $now | .message = null'
+      ;;
+
+    idle)
+      git_fields '.status = "idle"
+        | .updated_at = $now
+        | .message = null
+        | .title = (if (.title // "") == "" then $title else .title end)' \
+        --arg title "$(printf '%s' "$text" | short_title)"
+      ;;
+
+    *)
+      echo "aq-record: unknown event $event" >&2
+      usage
+      ;;
+  esac
+}
+
+# Set for the Claude that summarize_title runs, so its own session isn't
+# recorded.
+[ "${AQ_HOOK_DISABLED:-}" = "1" ] && exit 0
+
+mkdir -p "$AQ_STATE_DIR"
+main "$@"

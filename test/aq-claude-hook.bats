@@ -1,20 +1,20 @@
 #!/usr/bin/env bats
 
-HOOK="$BATS_TEST_DIRNAME/../bin/cq-hook"
+HOOK="$BATS_TEST_DIRNAME/../bin/aq-claude-hook"
 
 setup() {
-  export CQ_DIR="$(mktemp -d)"
+  export AQ_STATE_DIR="$(mktemp -d)"
   export REPO="$(mktemp -d)"
   export MOCK_DIR="$(mktemp -d)"
   export PATH="$MOCK_DIR:$PATH"
-  STATE="$CQ_DIR/s1.json"
+  STATE="$AQ_STATE_DIR/s1.json"
 
   # A claude that records how it was called, then replies with a title
   # after $CLAUDE_DELAY seconds.
   cat > "$MOCK_DIR/claude" << 'EOF'
 #!/usr/bin/env bash
 cat > /dev/null
-echo "$* CQ_HOOK_DISABLED=$CQ_HOOK_DISABLED" >> "$MOCK_DIR/claude_calls"
+echo "$* AQ_HOOK_DISABLED=$AQ_HOOK_DISABLED" >> "$MOCK_DIR/claude_calls"
 sleep "${CLAUDE_DELAY:-0}"
 echo '"Summarized title."'
 EOF
@@ -22,7 +22,7 @@ EOF
 }
 
 teardown() {
-  rm -rf "$CQ_DIR" "$REPO" "$MOCK_DIR"
+  rm -rf "$AQ_STATE_DIR" "$REPO" "$MOCK_DIR"
 }
 
 # Waits up to 5 seconds for the session's title to become $1.
@@ -46,12 +46,11 @@ field() {
   jq -r ".$1" "$STATE"
 }
 
-@test "SessionStart records the session as new, with its entrypoint" {
-  printf '{"hook_event_name":"SessionStart","session_id":"s1","cwd":"%s"}' "$REPO" \
-    | CLAUDE_CODE_ENTRYPOINT=sdk-ts /bin/bash "$HOOK"
+@test "SessionStart records the session as new, and as Claude's" {
+  printf '{"hook_event_name":"SessionStart","session_id":"s1","cwd":"%s"}' "$REPO" | /bin/bash "$HOOK"
   [ "$(field status)" = "new" ]
   [ "$(field cwd)" = "$REPO" ]
-  [ "$(field entrypoint)" = "sdk-ts" ]
+  [ "$(field agent)" = "claude" ]
 }
 
 @test "prints nothing and exits 0" {
@@ -108,7 +107,7 @@ field() {
   grep -q -- '--model haiku' "$MOCK_DIR/claude_calls"
   grep -q -- '--no-session-persistence' "$MOCK_DIR/claude_calls"
   grep -q -- '--tools  ' "$MOCK_DIR/claude_calls"
-  grep -q 'CQ_HOOK_DISABLED=1' "$MOCK_DIR/claude_calls"
+  grep -q 'AQ_HOOK_DISABLED=1' "$MOCK_DIR/claude_calls"
 }
 
 @test "the hook returns before the summary is ready" {
@@ -122,19 +121,19 @@ field() {
 @test "a late summary doesn't replace a newer prompt's title" {
   export CLAUDE_DELAY=1
   hook "{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"s1\",\"prompt\":\"$LONG_PROMPT\"}"
-  CQ_SUMMARIZE=0 hook '{"hook_event_name":"UserPromptSubmit","session_id":"s1","prompt":"Newer prompt"}'
+  AQ_SUMMARIZE=0 hook '{"hook_event_name":"UserPromptSubmit","session_id":"s1","prompt":"Newer prompt"}'
   sleep 1.5
   [ "$(field title)" = "Newer prompt" ]
 }
 
-@test "CQ_SUMMARIZE=0 turns summarizing off" {
-  CQ_SUMMARIZE=0 hook "{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"s1\",\"prompt\":\"$LONG_PROMPT\"}"
+@test "AQ_SUMMARIZE=0 turns summarizing off" {
+  AQ_SUMMARIZE=0 hook "{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"s1\",\"prompt\":\"$LONG_PROMPT\"}"
   sleep 0.3
   [ ! -f "$MOCK_DIR/claude_calls" ]
 }
 
-@test "CQ_HOOK_DISABLED=1 makes the hook do nothing" {
-  CQ_HOOK_DISABLED=1 hook '{"hook_event_name":"UserPromptSubmit","session_id":"s1","prompt":"hi"}'
+@test "AQ_HOOK_DISABLED=1 makes the hook do nothing" {
+  AQ_HOOK_DISABLED=1 hook '{"hook_event_name":"UserPromptSubmit","session_id":"s1","prompt":"hi"}'
   [ ! -f "$STATE" ]
 }
 
@@ -142,7 +141,7 @@ field() {
   hook '{"hook_event_name":"PreToolUse","session_id":"s1","tool_name":"AskUserQuestion"}'
   [ "$(field status)" = "needs-input" ]
   hook '{"hook_event_name":"PreToolUse","session_id":"s2","tool_name":"ExitPlanMode"}'
-  [ "$(jq -r .message "$CQ_DIR/s2.json")" = "Waiting for plan approval" ]
+  [ "$(jq -r .message "$AQ_STATE_DIR/s2.json")" = "Waiting for plan approval" ]
 }
 
 @test "other PreToolUse calls write nothing" {
@@ -163,7 +162,7 @@ field() {
 }
 
 @test "Stop takes the title from the transcript when there isn't one" {
-  transcript="$CQ_DIR/t.jsonl"
+  transcript="$AQ_STATE_DIR/t.jsonl"
   echo '{"type":"user","message":{"content":[{"type":"text","text":"Resumed prompt"}]}}' > "$transcript"
   hook "{\"hook_event_name\":\"Stop\",\"session_id\":\"s1\",\"transcript_path\":\"$transcript\"}"
   [ "$(field title)" = "Resumed prompt" ]
@@ -181,9 +180,9 @@ field() {
 }
 
 @test "records the PID of the nearest claude process" {
-  # Run the hook under a process whose command mentions claude.
+  # Run the hook under a process called claude.
   printf '{"hook_event_name":"Stop","session_id":"s1"}' \
-    | bash -c 'exec -a fake-claude bash -c "bash \"$0\"; :" ' "$HOOK"
+    | bash -c 'exec -a claude bash -c "bash \"$0\"; :" ' "$HOOK"
   pid="$(field pid)"
   [ "$pid" != "null" ]
   [ -n "$(field pid_started)" ]
@@ -197,14 +196,14 @@ field() {
 }
 
 # run_under <argv0> <hook input> [env...]: runs the hook under a process
-# called fake-claude, under a process called <argv0>. Each runs the next as
+# called claude, under a process called <argv0>. Each runs the next as
 # a child, so neither is replaced by it.
 run_under() {
   local argv0="$1" input="$2"
   shift 2
   cat > "$MOCK_DIR/under" << 'SCRIPT'
 #!/bin/bash
-(exec -a fake-claude /bin/bash -c '/bin/bash "$0"; :' "$1")
+(exec -a claude /bin/bash -c '/bin/bash "$0"; :' "$1")
 SCRIPT
   printf '%s' "$input" | env "$@" bash -c '(exec -a "$0" /bin/bash "$1" "$2")' \
     "$argv0" "$MOCK_DIR/under" "$HOOK"

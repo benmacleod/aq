@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+#
+# aq's adapter for Codex. Reads a hook's JSON from stdin and records the
+# session's state with aq-record.
+#
+# Hook it up in ~/.codex/hooks.json for SessionStart, UserPromptSubmit,
+# PermissionRequest, PostToolUse, Stop, Interrupt and SessionEnd. See the
+# README. Codex only runs hooks you have reviewed and trusted, with /hooks.
+#
+# It always exits 0 and prints nothing: Codex reads some hooks' output as
+# decisions, and a failing hook mustn't get in Codex's way. Errors go to
+# $AQ_STATE_DIR/hook-errors.log.
+
+set -uo pipefail
+
+DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+source "$DIR/../lib/aq.sh"
+
+main() {
+  local input id
+  input="$(cat)"
+  id="$(jq -r '.session_id // empty' <<<"$input")"
+  [ -n "$id" ] || return 0
+
+  record() {
+    "$DIR/aq-record" --agent codex --session "$id" \
+      --cwd "$(jq -r '.cwd // empty' <<<"$input")" \
+      --transcript "$(jq -r '.transcript_path // empty' <<<"$input")" "$@"
+  }
+
+  case "$(jq -r '.hook_event_name // empty' <<<"$input")" in
+    SessionStart) record start ;;
+    UserPromptSubmit) record prompt "$(jq -r '.prompt // empty' <<<"$input")" ;;
+
+    PermissionRequest)
+      # e.g. "Approve Bash: make clean"
+      record needs-input "$(jq -r '
+        (.tool_input.command // "" | if type == "array" then join(" ") else tostring end) as $command
+        | "Approve \(.tool_name // "a tool")" + (if $command == "" then "" else ": " + $command end)
+        ' <<<"$input" | head -n1)"
+      ;;
+
+    PostToolUse) record answered ;;
+    # Interrupt: you stopped the turn, so it's your move again.
+    Stop | Interrupt) record idle ;;
+    SessionEnd) record end ;;
+  esac
+}
+
+[ "${AQ_HOOK_DISABLED:-}" = "1" ] && exit 0
+
+mkdir -p "$AQ_STATE_DIR" 2>/dev/null
+main >/dev/null 2>>"$AQ_STATE_DIR/hook-errors.log"
+exit 0

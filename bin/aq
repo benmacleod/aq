@@ -2,16 +2,17 @@
 set -euo pipefail
 
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"
-source "$(dirname "$SELF")/../lib/cq.sh"
+source "$(dirname "$SELF")/../lib/aq.sh"
 
-NOW="$(cq_now)"
+NOW="$(aq_now)"
 
 usage() {
   cat <<EOF
 Usage: $(basename "$0") [command] [args]
 
-Lists your Claude sessions, the ones waiting for you first. cq-hook records
-the state; a session stays flagged until you reply to it.
+Lists your coding agents' sessions, the ones waiting for you first. Each
+agent's hooks record the state (see aq-record); a session stays flagged until
+you reply to it.
 
 Commands:
   list [-a]             List sessions that need input, then idle ones, then
@@ -25,45 +26,50 @@ Commands:
                         The default is 1h.
   dismiss <n|id>        Take the session off the list. It comes back when
                         you next send it a prompt.
-  prune [days]          Remove sessions whose directory or Claude process
+  prune [days]          Remove sessions whose directory or agent process
                         has gone, and sessions untouched for longer than
-                        <days> (default \$CQ_PRUNE_DAYS or 3).
+                        <days> (default \$AQ_PRUNE_DAYS or 3).
   --swiftbar            Print the list in SwiftBar's menu format.
 
 <n> is a row number from the list. <id> is a session ID or a prefix of one.
 EOF
 }
 
-CQ_CONFIG_DIR="${CQ_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/cq}"
-
 # Prints a message, and also shows it as a notification, since nobody sees
-# the output when SwiftBar runs cq.
+# the output when SwiftBar runs aq.
 notify() {
   echo "$1" >&2
-  terminal-notifier -title cq -message "$1" -group cq >/dev/null 2>&1 || true
+  terminal-notifier -title aq -message "$1" -group aq >/dev/null 2>&1 || true
 }
 
-# cq's settings. $CQ_CONFIG_DIR/config.json, in the same shape, is merged
+# aq's settings. $AQ_CONFIG_DIR/config.json, in the same shape, is merged
 # over these.
 #
-# apps: the apps cq knows, by bundle ID: the name and emoji to show, and the
+# apps: the apps aq knows, by bundle ID: the name and emoji to show, and the
 # opener that switches to a session (see run_opener). Other apps get 💻,
 # their TERM_PROGRAM as a name, and the "activate" opener.
 #
-# repos: an emoji to show for each repo, by name (see repo_name in cq-hook),
-# e.g. {"tc": "📰"}.
+# agents: the name and emoji to show for each agent. Other agents show their
+# own name, and no emoji.
+#
+# repos: an emoji to show for each repo, by name (see repo_name in
+# aq-record), e.g. {"tc": "📰"}.
 CONFIG='{
   "apps": {
     "dev.zed.Zed": {"name": "Zed", "emoji": "⚡", "open": "zed-window"},
     "org.tabby": {"name": "Tabby", "emoji": "🐈"}
   },
+  "agents": {
+    "claude": {"name": "Claude", "emoji": ""},
+    "codex": {"name": "Codex", "emoji": "🤖"}
+  },
   "repos": {}
 }'
-if [ -f "$CQ_CONFIG_DIR/config.json" ]; then
-  if merged="$(jq -s '.[0] * .[1]' <(echo "$CONFIG") "$CQ_CONFIG_DIR/config.json" 2>/dev/null)"; then
+if [ -f "$AQ_CONFIG_DIR/config.json" ]; then
+  if merged="$(jq -s '.[0] * .[1]' <(echo "$CONFIG") "$AQ_CONFIG_DIR/config.json" 2>/dev/null)"; then
     CONFIG="$merged"
   else
-    notify "Ignoring $CQ_CONFIG_DIR/config.json, which isn't valid JSON."
+    notify "Ignoring $AQ_CONFIG_DIR/config.json, which isn't valid JSON."
   fi
 fi
 
@@ -102,7 +108,7 @@ tmux_json() {
 TMUX_JSON="$(tmux_json)"
 
 # jq with the definitions the commands share.
-cq_jq() {
+aq_jq() {
   jq --argjson now "$NOW" --arg home "$HOME" --argjson config "$CONFIG" --argjson tmux "$TMUX_JSON" "$@"
 }
 
@@ -114,13 +120,15 @@ JQ_DEFS='
       else "\($s / 86400 | floor)d" end;
   def place: (.cwd // "?") | if . == $home then "~" else split("/") | last end;
   def repo_emoji: $config.repos[.repo // ""] // "";
+  # The agent: {name, emoji}. Sessions recorded before aq-record stored the
+  # agent are Claude.
+  def agent: (.agent // "claude") as $a | {name: $a, emoji: ""} + ($config.agents[$a] // {});
   def title: .title // "" | select(. != "");
   # Where the session is showing in tmux, if it runs in tmux: see tmux_json.
   def tmux: $tmux[.tmux_pane // ""];
   # The app the session runs in: {id, name, emoji, open}. For a session in
-  # tmux, that is the terminal showing its tmux session. Sessions recorded
-  # before cq-hook stored the bundle ID are matched on TERM_PROGRAM, and
-  # are Zed if they ran in no terminal.
+  # tmux, that is the terminal showing its tmux session. A session with no
+  # bundle ID recorded is matched on TERM_PROGRAM.
   def app:
     (if tmux then (tmux.app // "") else (.app // "") end) as $id
     | (if tmux then "" else (.term_program // "") end) as $term
@@ -129,7 +137,6 @@ JQ_DEFS='
     | if $apps[$id] then $apps[$id]
       elif tmux and $id == "" then {name: "tmux", emoji: "💻"}
       elif $id == "" and $by_name then $by_name
-      elif $id == "" and (.entrypoint != "cli" or $term == "zed") then $apps["dev.zed.Zed"]
       else {name: ([$term, $id, "terminal"] | map(select(. != "")) | first), emoji: "💻"}
       end
     | {id: $id, open: "activate"} + .;
@@ -152,13 +159,13 @@ JQ_DEFS='
 # remove_stale [days]
 #
 # Deletes the state of sessions whose directory has gone, or whose recorded
-# Claude process has exited (or whose PID now belongs to another process).
+# agent process has exited (or whose PID now belongs to another process).
 # Given <days>, also deletes sessions untouched for that long, and ones
 # working or never prompted for over a day: they never sent Stop or
 # SessionEnd. Prints a line per session it removes.
 remove_stale() {
   local days="${1:-}" f id cwd status updated pid pid_started reason
-  for f in "$CQ_DIR"/*.json; do
+  for f in "$AQ_STATE_DIR"/*.json; do
     [ -e "$f" ] || continue
     IFS=$'\x1f' read -r id cwd status updated pid pid_started < <(jq -r '
       [.session_id, .cwd, .status, (.updated_at // 0), .pid, .pid_started]
@@ -166,8 +173,8 @@ remove_stale() {
     reason=""
     if [ -z "$cwd" ] || [ ! -d "$cwd" ]; then
       reason="directory gone"
-    elif [ -n "$pid" ] && [ "$(cq_process_started "$pid")" != "$pid_started" ]; then
-      reason="Claude process gone"
+    elif [ -n "$pid" ] && [ "$(aq_process_started "$pid")" != "$pid_started" ]; then
+      reason="agent process gone"
     elif [ -n "$days" ] && [[ "$status" =~ ^(working|new)$ ]] && [ "$updated" -lt $((NOW - 86400)) ]; then
       reason="$status for over a day"
     elif [ -n "$days" ] && [ "$updated" -lt $((NOW - days * 86400)) ]; then
@@ -184,9 +191,9 @@ remove_stale() {
 states_json() {
   local files
   remove_stale >/dev/null
-  files=("$CQ_DIR"/*.json)
+  files=("$AQ_STATE_DIR"/*.json)
   { [ -e "${files[0]}" ] && cat "${files[@]}" || true; } \
-    | cq_jq -s --argjson all "$1" "$JQ_DEFS visible(\$all)"
+    | aq_jq -s --argjson all "$1" "$JQ_DEFS visible(\$all)"
 }
 
 # Turns a row number or session ID prefix into a session ID.
@@ -197,7 +204,7 @@ resolve() {
       || { echo "No row $ref" >&2; return 1; }
     return
   fi
-  for f in "$CQ_DIR/$ref"*.json; do
+  for f in "$AQ_STATE_DIR/$ref"*.json; do
     [ -e "$f" ] && matches+=("$(basename "$f" .json)")
   done
   case "${#matches[@]}" in
@@ -210,10 +217,10 @@ resolve() {
 cmd_list() {
   local all=false rows
   [ "${1:-}" = "-a" ] && all=true
-  rows="$(states_json "$all" | cq_jq -r "$JQ_DEFS
+  rows="$(states_json "$all" | aq_jq -r "$JQ_DEFS
     to_entries[]
     | [(.key + 1), .value.status, (.value.updated_at | age), (.value | (repo_emoji | if . == \"\" then \"\" else . + \" \" end) + place),
-       (.value.branch // \"\"), (.value | app | .name), (.value | title // \"\"),
+       (.value.branch // \"\"), (.value | \"\\(agent.name) in \\(app.name)\"), (.value | title // \"\"),
        (.value.message // \"\"), .value.session_id[0:8]]
     | map(tostring | gsub(\"[\\u001f\\n]\"; \" \")) | join(\"\\u001f\")")"
   if [ -z "$rows" ]; then
@@ -244,30 +251,30 @@ cmd_list() {
 # runs plugins with, brace-expands a {a, b} inside a double-quoted string
 # inside $(...), which split this into several jq programs.
 OPENER_ENV='
-  {CQ_SESSION_ID: .session_id, CQ_CWD: .cwd, CQ_PLACE: place, CQ_TTY: .tty,
-   CQ_APP: app.id, CQ_APP_NAME: app.name}
+  {AQ_SESSION_ID: .session_id, AQ_CWD: .cwd, AQ_PLACE: place, AQ_TTY: .tty,
+   AQ_APP: app.id, AQ_APP_NAME: app.name}
   | to_entries[] | "export \(.key)=\(.value // "" | @sh)"'
 
 # run_opener <name> <session JSON>
 #
-# Runs the opener called <name>: an executable in $CQ_CONFIG_DIR/openers, or
-# one of cq's own in lib/cq-openers. It gets the session's details as CQ_*
+# Runs the opener called <name>: an executable in $AQ_CONFIG_DIR/openers, or
+# one of aq's own in lib/aq-openers. It gets the session's details as AQ_*
 # environment variables. Whatever it prints is shown as a notification, and
-# its exit status is cq open's.
+# its exit status is aq open's.
 run_opener() {
   local name="$1" session="$2" opener="" dir output status
-  for dir in "$CQ_CONFIG_DIR/openers" "$(dirname "$SELF")/../lib/cq-openers"; do
+  for dir in "$AQ_CONFIG_DIR/openers" "$(dirname "$SELF")/../lib/aq-openers"; do
     if [ -x "$dir/$name" ]; then
       opener="$dir/$name"
       break
     fi
   done
   if [ -z "$opener" ]; then
-    notify "There's no cq opener called $name. Add one to $CQ_CONFIG_DIR/openers."
+    notify "There's no aq opener called $name. Add one to $AQ_CONFIG_DIR/openers."
     return 1
   fi
   local exports
-  exports="$(cq_jq -r "$JQ_DEFS $OPENER_ENV" <<<"$session")"
+  exports="$(aq_jq -r "$JQ_DEFS $OPENER_ENV" <<<"$session")"
   status=0
   output="$(eval "$exports"; "$opener")" || status=$?
   [ -n "$output" ] && notify "$output"
@@ -278,13 +285,13 @@ cmd_open() {
   [ $# -ge 1 ] || { usage >&2; exit 1; }
   local id session cwd place opener pane tmux_session client_tty app_id
   id="$(resolve "$1")"
-  session="$(cat "$(cq_state_file "$id")")"
-  IFS=$'\x1f' read -r cwd place opener pane tmux_session client_tty app_id < <(cq_jq -r "$JQ_DEFS
+  session="$(cat "$(aq_state_file "$id")")"
+  IFS=$'\x1f' read -r cwd place opener pane tmux_session client_tty app_id < <(aq_jq -r "$JQ_DEFS
     [.cwd, place, app.open, .tmux_pane, tmux.session, tmux.client_tty, app.id]
     | map(. // \"\") | join(\"\\u001f\")" <<<"$session")
 
   if [ -z "$cwd" ] || [ ! -d "$cwd" ]; then
-    notify "The session's directory ($cwd) no longer exists. Try: cq prune"
+    notify "The session's directory ($cwd) no longer exists. Try: aq prune"
     exit 1
   fi
 
@@ -315,7 +322,7 @@ cmd_snooze() {
     exit 1
   fi
   case "${BASH_REMATCH[2]}" in m) unit=60 ;; h) unit=3600 ;; d) unit=86400 ;; esac
-  cq_merge_state "$id" '.snoozed_until = $until' \
+  aq_merge_state "$id" '.snoozed_until = $until' \
     --argjson until "$((NOW + BASH_REMATCH[1] * unit))"
   echo "Snoozed ${id:0:8} for $dur"
 }
@@ -324,13 +331,13 @@ cmd_dismiss() {
   [ $# -ge 1 ] || { usage >&2; exit 1; }
   local id
   id="$(resolve "$1")"
-  rm -f "$(cq_state_file "$id")"
+  rm -f "$(aq_state_file "$id")"
   echo "Dismissed ${id:0:8}"
 }
 
 cmd_prune() {
   local removed
-  removed="$(remove_stale "${1:-${CQ_PRUNE_DAYS:-3}}")"
+  removed="$(remove_stale "${1:-${AQ_PRUNE_DAYS:-3}}")"
   [ -n "$removed" ] && echo "$removed"
   echo "Pruned $(grep -c . <<<"$removed" || true) session(s)."
 }
@@ -341,13 +348,13 @@ cmd_prune() {
 # Option swaps in an alternate line that dismisses it. Text is shortened
 # here, because SwiftBar's own length param also broke submenus.
 cmd_swiftbar() {
-  states_json false | cq_jq -r --arg cq "$SELF" "$JQ_DEFS
+  states_json false | aq_jq -r --arg aq "$SELF" "$JQ_DEFS
     def clean: gsub(\"[|\\\"]\"; \"\");
     def trunc(\$n): if length > \$n then .[0:\$n - 1] + \"…\" else . end;
-    def run(\$cmd; \$id): \" | bash=\" + \$cq + \" param1=\" + \$cmd + (\$id | if . then \" param2=\" + . else \"\" end) + \" terminal=false refresh=true\";
+    def run(\$cmd; \$id): \" | bash=\" + \$aq + \" param1=\" + \$cmd + (\$id | if . then \" param2=\" + . else \"\" end) + \" terminal=false refresh=true\";
     def tooltip:
       [(.message // \"\" | select(. != \"\")),
-       \"Running in \(where)\",
+       \"\(agent.name), running in \(where)\",
        \"Option-click to dismiss\"]
       | join(\". \") | clean;
     ([.[] | select(.status == \"needs-input\")] | length) as \$needs
@@ -357,7 +364,7 @@ cmd_swiftbar() {
       \"---\",
       (.[]
         | ({\"needs-input\": \"🟠\", \"working\": \"🔵\"}[.status] // \"⚪\") as \$icon
-        | \"\(repo_emoji)\(app | .emoji)\(\$icon) \([place, (.updated_at | age), title] | join(\" · \") | clean | trunc(80))\"
+        | \"\(repo_emoji)\(app.emoji)\(agent.emoji)\(\$icon) \([place, (.updated_at | age), title] | join(\" · \") | clean | trunc(80))\"
             + run(\"open\"; .session_id) + \" tooltip=\\\"\(tooltip)\\\"\",
           \"✕ Dismiss: \([place, title] | join(\" · \") | clean | trunc(70))\"
             + run(\"dismiss\"; .session_id) + \" alternate=true\"),

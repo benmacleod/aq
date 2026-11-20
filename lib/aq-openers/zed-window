@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# cq opener for Zed: brings forward the window for the session's project
+# aq opener for Zed: brings forward the window for the session's project
 # folder, by window title. Zed titles a window after its project folder,
 # e.g. "tc-5031 — README.md".
 #
@@ -8,12 +8,12 @@
 # cli_default_open_behavior is "new_window", and `zed -e <dir>` opens the
 # folder in whichever window is current.
 #
-# Needs Accessibility permission for whatever runs cq: SwiftBar, or your
+# Needs Accessibility permission for whatever runs aq: SwiftBar, or your
 # terminal.
 #
 # See "Openers" in the README for what an opener gets and must do.
 
-name="$(basename "$CQ_CWD")"
+name="$(basename "$AQ_CWD")"
 result="$(osascript - "$name" 2>&1 <<'EOF'
 on run argv
   set folderName to item 1 of argv
@@ -35,7 +35,7 @@ case "$result" in
   no-zed) echo "Zed isn't running." ;;
   no-window) echo "No Zed window is open on $name." ;;
   *assistive\ access*|*-1719*|*-25211*)
-    echo "cq needs Accessibility permission to switch Zed windows. Add SwiftBar (or your terminal) in System Settings > Privacy & Security > Accessibility." ;;
+    echo "aq needs Accessibility permission to switch Zed windows. Add SwiftBar (or your terminal) in System Settings > Privacy & Security > Accessibility." ;;
   *) echo "Couldn't switch to the Zed window for $name: $result" ;;
 esac
 exit 1

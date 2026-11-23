@@ -39,9 +39,12 @@ main() {
   id="$(jq -r '.session_id // empty' <<<"$input")"
   [ -n "$id" ] || return 0
 
+  # The session's directory is Claude's project directory: the folder the
+  # app opened, which openers look for. The hook's cwd follows Claude's cds
+  # into subfolders.
   record() {
     "$DIR/aq-record" --agent claude --session "$id" \
-      --cwd "$(jq -r '.cwd // empty' <<<"$input")" \
+      --cwd "${CLAUDE_PROJECT_DIR:-$(jq -r '.cwd // empty' <<<"$input")}" \
       --transcript "$(jq -r '.transcript_path // empty' <<<"$input")" "$@"
   }
 

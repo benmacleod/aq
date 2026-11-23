@@ -2,7 +2,9 @@
 #
 # aq opener for Zed: brings forward the window for the session's project
 # folder, by window title. Zed titles a window after its project folder,
-# e.g. "tc-5031 — README.md".
+# e.g. "tc-5031 — README.md". If no window is open on the folder itself, it
+# tries each folder above it, nearest first, in case the agent has moved into
+# a subfolder of the project.
 #
 # The zed CLI can't do this: `zed <dir>` opens a new window when
 # cli_default_open_behavior is "new_window", and `zed -e <dir>` opens the
@@ -14,19 +16,33 @@
 # See "Openers" in the README for what an opener gets and must do.
 
 name="$(basename "$AQ_CWD")"
-result="$(osascript - "$name" 2>&1 <<'EOF'
+
+# The folder's name, then its parents', stopping short of $HOME and /.
+names=()
+dir="${AQ_CWD%/}"
+while [ -n "$dir" ] && [ "$dir" != "/" ] && [ "$dir" != "$HOME" ]; do
+  names+=("$(basename "$dir")")
+  dir="$(dirname "$dir")"
+done
+[ ${#names[@]} -gt 0 ] || names=("$name")
+
+result="$(osascript - "${names[@]}" 2>&1 <<'EOF'
 on run argv
-  set folderName to item 1 of argv
   tell application "System Events"
     if not (exists process "Zed") then return "no-zed"
     tell process "Zed"
-      set matches to (every window whose name is folderName or name starts with (folderName & " "))
-      if matches is {} then return "no-window"
-      perform action "AXRaise" of item 1 of matches
-      set frontmost to true
+      repeat with folderName in argv
+        set folderName to folderName as text
+        set matches to (every window whose name is folderName or name starts with (folderName & " "))
+        if matches is not {} then
+          perform action "AXRaise" of item 1 of matches
+          set frontmost to true
+          return "ok"
+        end if
+      end repeat
     end tell
   end tell
-  return "ok"
+  return "no-window"
 end run
 EOF
 )"

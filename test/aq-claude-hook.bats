@@ -8,6 +8,8 @@ setup() {
   export MOCK_DIR="$(mktemp -d)"
   export PATH="$MOCK_DIR:$PATH"
   STATE="$AQ_STATE_DIR/s1.json"
+  # Claude sets this for hooks, and for anything Claude itself runs.
+  unset CLAUDE_PROJECT_DIR
 
   # A claude that records how it was called, then replies with a title
   # after $CLAUDE_DELAY seconds.
@@ -51,6 +53,12 @@ field() {
   [ "$(field status)" = "new" ]
   [ "$(field cwd)" = "$REPO" ]
   [ "$(field agent)" = "claude" ]
+}
+
+@test "records Claude's project directory, not the directory Claude has cd'd into" {
+  printf '{"hook_event_name":"SessionStart","session_id":"s1","cwd":"%s/sub"}' "$REPO" \
+    | CLAUDE_PROJECT_DIR="$REPO" /bin/bash "$HOOK"
+  [ "$(field cwd)" = "$REPO" ]
 }
 
 @test "prints nothing and exits 0" {

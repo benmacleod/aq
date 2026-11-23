@@ -94,9 +94,17 @@ state() {
   state s1 needs-input 5
   run /bin/bash "$SCRIPT" open 1
   [ "$status" -eq 0 ]
-  grep -q "^osascript - $(basename "$REPO")$" "$MOCK_DIR/calls"
+  grep -q "^osascript - $(basename "$REPO") " "$MOCK_DIR/calls"
   # The zed CLI opens a new window rather than switching to the open one.
   ! grep -q "^zed" "$MOCK_DIR/calls"
+}
+
+@test "open looks for a Zed window on the folder, then on each folder above it" {
+  mkdir "$REPO/rails"
+  state s1 needs-input 5 ".cwd = \"$REPO/rails\""
+  run /bin/bash "$SCRIPT" open s1
+  [ "$status" -eq 0 ]
+  grep -q "^osascript - rails $(basename "$REPO") $(basename "$(dirname "$REPO")") " "$MOCK_DIR/calls"
 }
 
 @test "open says so when no Zed window has the folder open" {

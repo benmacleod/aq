@@ -78,6 +78,20 @@ process_host() {
   done
 }
 
+# tmux_pane_of <pid>: prints the tmux pane the process runs in (e.g. %11),
+# by finding the pane's own process among its ancestors. For when TMUX_PANE
+# isn't set: a shell config can unset it, e.g. one that clears a TMUX that
+# leaked in from elsewhere.
+tmux_pane_of() {
+  local pid="$1" panes pane
+  panes="$(tmux list-panes -a -F '#{pane_pid} #{pane_id}' 2>/dev/null)" || return 0
+  while [ -n "$pid" ] && [ "$pid" -gt 1 ]; do
+    pane="$(awk -v pid="$pid" '$1 == pid { print $2; exit }' <<<"$panes")"
+    [ -n "$pane" ] && { echo "$pane"; return 0; }
+    pid="$(ps -o ppid= -p "$pid" | tr -d ' ')"
+  done
+}
+
 # Prints the name of the repo the directory is in: the last part of its
 # origin URL (e.g. tc), or else the folder of its main checkout, so that
 # every worktree of a repo gets the same name.
@@ -159,6 +173,9 @@ main() {
   fi
   # Outside tmux, any TMUX_PANE was passed down from elsewhere, and so was
   # TERM_PROGRAM if the app differs. "none" clears the recorded value.
+  if [ "$host" = "tmux" ] && [ -z "$tmux_pane" ]; then
+    tmux_pane="$(tmux_pane_of "$pid")"
+  fi
   if [ -n "$host" ] && [ "$host" != "tmux" ]; then
     tmux_pane="none"
     [ "$host" = "$app" ] || term_program="none"

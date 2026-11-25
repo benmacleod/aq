@@ -240,6 +240,18 @@ fake_app() {
   [ "$(field tmux_pane)" = "%16" ]
 }
 
+@test "finds the tmux pane of a Claude running in tmux whose shell unset TMUX_PANE" {
+  # A tmux that says every process is pane %16's own.
+  cat > "$MOCK_DIR/tmux" << 'EOF'
+#!/bin/bash
+[ "$1" = "list-panes" ] && /bin/ps -A -o pid= | awk '{ print $1, "%16" }'
+EOF
+  chmod +x "$MOCK_DIR/tmux"
+  run_under tmux '{"hook_event_name":"Stop","session_id":"s1"}' \
+    __CFBundleIdentifier=org.tabby TERM_PROGRAM=tmux
+  [ "$(field tmux_pane)" = "%16" ]
+}
+
 @test "records the repo, the same for every worktree" {
   git -C "$REPO" init -q
   git -C "$REPO" remote add origin git@github.com:someone/my-repo.git

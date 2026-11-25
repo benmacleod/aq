@@ -154,6 +154,16 @@ state() {
   ! grep -q "^osascript" "$MOCK_DIR/calls"
 }
 
+@test "open switches tmux, then the Zed window, for a tmux session showing in Zed's terminal" {
+  state abc123 idle 5 'del(.app) | .app = "org.tabby" | .tmux_pane = "%3"'
+  export TMUX_PANES='%3\t4\n' TMUX_CLIENTS='4\t100\t/dev/ttys008\t555\n' PS_BUNDLE=dev.zed.Zed
+  run /bin/bash "$SCRIPT" open abc
+  [ "$status" -eq 0 ]
+  grep -q "^tmux switch-client -c /dev/ttys008 -t %3$" "$MOCK_DIR/calls"
+  grep -q "^osascript - $(basename "$REPO") " "$MOCK_DIR/calls"
+  ! grep -q "^open -b" "$MOCK_DIR/calls"
+}
+
 @test "a tmux session uses the terminal most recently active on it" {
   state abc123 idle 5 'del(.app) | .tmux_pane = "%3"'
   export TMUX_PANES='%3\t4\n' TMUX_CLIENTS='4\t100\t/dev/ttys008\t555\n4\t200\t/dev/ttys013\t556\n'

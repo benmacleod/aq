@@ -297,7 +297,9 @@ cmd_open() {
 
   # In tmux: switch the terminal showing the session's tmux session to the
   # session's pane (not whichever terminal tmux used last), then bring that
-  # terminal forward.
+  # terminal forward. An app with its own opener, e.g. Zed, can have several
+  # windows, so the opener picks the right one. The activate opener would
+  # name the pane's TTY, not the terminal's, so it's skipped.
   if [ -n "$tmux_session" ]; then
     if [ -z "$client_tty" ]; then
       notify "$place is in tmux session $tmux_session, which no terminal is showing. Run: tmux attach -t $tmux_session"
@@ -306,6 +308,10 @@ cmd_open() {
     tmux switch-client -c "$client_tty" -t "$pane"
     tmux select-window -t "$pane"
     tmux select-pane -t "$pane"
+    if [ "$opener" != "activate" ]; then
+      run_opener "$opener" "$session"
+      return
+    fi
     [ -n "$app_id" ] && open -b "$app_id" 2>/dev/null
     return 0
   fi
